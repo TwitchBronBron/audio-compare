@@ -648,8 +648,15 @@ class ComparisonSorter {
     this._estimateTotal();
   }
   _estimateTotal() {
-    const n = this.items.length;
-    this.estTotal = n <= 1 ? 0 : Math.ceil(n * Math.log2(n));
+    // Exact worst-case comparison count for THIS list, computed by walking the
+    // same split structure the sort uses and summing (left+right-1) per merge.
+    // (Actual runs can be fewer when one side of a merge empties early.)
+    const worst = (len) => {
+      if (len <= 1) return 0;
+      const mid = Math.floor(len / 2);
+      return worst(mid) + worst(len - mid) + (len - 1);
+    };
+    this.estTotal = worst(this.items.length);
   }
   // ask user to compare a pair. If we have a recorded answer (from a previous
   // session), replay it silently; otherwise prompt the user and record it.
