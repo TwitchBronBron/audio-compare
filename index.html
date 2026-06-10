@@ -1,0 +1,926 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Audio Comparison</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #1a1d24;
+    --panel-2: #232732;
+    --accent: #5b8cff;
+    --accent-2: #ff7a59;
+    --text: #e6e9ef;
+    --muted: #8b93a7;
+    --wave-bg: #2a2f3a;
+    --wave-a: #5b8cff;
+    --wave-b: #ff7a59;
+    --border: #2c313c;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.5;
+  }
+  header {
+    padding: 20px 24px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: baseline;
+    gap: 16px;
+    flex-wrap: wrap;
+  }
+  header h1 { font-size: 20px; margin: 0; font-weight: 600; }
+  header .sub { color: var(--muted); font-size: 14px; }
+  main { max-width: 920px; margin: 0 auto; padding: 24px; }
+
+  .hidden { display: none !important; }
+
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 20px;
+    margin-bottom: 16px;
+  }
+
+  button {
+    font: inherit;
+    cursor: pointer;
+    border: none;
+    border-radius: 8px;
+    padding: 10px 16px;
+    background: var(--panel-2);
+    color: var(--text);
+    transition: background .12s, transform .05s;
+  }
+  button:hover { background: #2e3340; }
+  button:active { transform: translateY(1px); }
+  button.primary { background: var(--accent); color: #fff; }
+  button.primary:hover { background: #6e9bff; }
+  button.ghost { background: transparent; border: 1px solid var(--border); }
+
+  .folder-list { display: flex; flex-direction: column; gap: 10px; }
+  .folder-btn {
+    text-align: left;
+    padding: 16px;
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    font-size: 16px;
+  }
+  .folder-btn:hover { border-color: var(--accent); }
+
+  .progress-bar {
+    height: 6px; background: var(--panel-2); border-radius: 3px;
+    overflow: hidden; margin: 4px 0 18px;
+  }
+  .progress-fill { height: 100%; background: var(--accent); width: 0%; transition: width .25s; }
+
+  /* DAW-style stacked lanes — one playhead sweeps across all in parallel */
+  .vs-wrap { display: flex; flex-direction: column; gap: 0; }
+
+  .lane {
+    display: grid;
+    grid-template-columns: 44px 196px 1fr;
+    align-items: stretch;
+    gap: 0;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-bottom: none;
+    transition: background .12s, box-shadow .12s;
+    cursor: pointer;            /* click anywhere switches to this track */
+  }
+  .lane:first-of-type { border-radius: 12px 12px 0 0; }
+  .lane:last-of-type  { border-radius: 0 0 12px 12px; border-bottom: 1px solid var(--border); }
+  /* active (audible) lane: colored left bar (the radio column already shows the dot) + tint */
+  .lane.active-audio { box-shadow: inset 4px 0 0 0 var(--c); background: #20242e; }
+  .lane:not(.active-audio):hover { background: #1b1f27; }
+
+  /* radio selector column — fixed width so toggling never shifts layout */
+  .lane-radio {
+    display: grid; place-items: center;
+    border-right: 1px solid var(--border);
+  }
+  .radio-dot {
+    width: 18px; height: 18px; border-radius: 50%;
+    border: 2px solid var(--muted); background: transparent;
+    display: grid; place-items: center; transition: border-color .12s;
+  }
+  .radio-dot::after {
+    content: ""; width: 9px; height: 9px; border-radius: 50%;
+    background: var(--c); transform: scale(0); transition: transform .12s;
+  }
+  .lane.active-audio .radio-dot { border-color: var(--c); }
+  .lane.active-audio .radio-dot::after { transform: scale(1); }
+  .lane.active-audio.is-playing .radio-dot::after { animation: pulse 1s infinite; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .3; } }
+
+  /* left control column: badge + name + state */
+  .lane-side {
+    display: flex; flex-direction: column; justify-content: center; gap: 6px;
+    padding: 12px 14px; border-right: 1px solid var(--border); overflow: hidden;
+  }
+  .lane-head { display: flex; align-items: center; gap: 8px; }
+  .badge {
+    font-size: 12px; font-weight: 800; color: #fff;
+    border-radius: 6px; padding: 2px 9px; width: max-content; background: var(--c);
+  }
+  .nm { font-size: 15px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+  .lane > * { min-width: 0; }   /* let the 1fr waveform column actually shrink */
+  .waveform-wrap { position: relative; min-width: 0; overflow: hidden; }
+  canvas.waveform {
+    width: 100%; max-width: 100%; height: 88px; display: block;
+    background: var(--wave-bg); cursor: pointer;
+  }
+  /* name label above the waveform (results lanes) */
+  .wave-label {
+    padding: 8px 12px 6px; background: var(--wave-bg);
+    border-bottom: 1px solid rgba(0,0,0,.25);
+  }
+  .wave-label .nm { font-size: 15px; font-weight: 600; color: var(--text); }
+  .lane.active-audio .wave-label .nm { color: var(--c); }
+
+  /* results: left column only holds radio + number, so it can be narrow */
+  .lane.ranked { grid-template-columns: 44px 56px 1fr; }
+  .lane.ranked .lane-side { justify-content: center; align-items: center; padding: 0; }
+
+  /* shared transport bar under the lanes */
+  .transport {
+    display: flex; align-items: center; gap: 16px;
+    margin-top: 14px; padding: 6px 2px;
+  }
+  .transport-play {
+    width: 52px; height: 52px; border-radius: 50%; padding: 0;
+    background: var(--accent); color: #fff;
+    display: grid; place-items: center; flex: 0 0 auto;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .transport-play:hover { background: #6e9bff; }
+  .transport-play:active { background: #4a7bff; transform: none; }
+  .transport-play:focus { outline: none; }
+  .transport-play:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }
+  .transport-play svg { width: 22px; height: 22px; display: block; fill: currentColor; }
+  .t-time { font-variant-numeric: tabular-nums; color: var(--muted); font-size: 14px; }
+  .t-hint { color: var(--muted); font-size: 13px; margin-left: auto; }
+
+  /* pick buttons */
+  .pick-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 16px; }
+  .pick-btn { font-size: 16px; font-weight: 700; padding: 16px; color: #fff; }
+  .pick-btn.a { background: var(--wave-a); }
+  .pick-btn.b { background: var(--wave-b); }
+  .pick-btn:hover { filter: brightness(1.1); }
+
+  @media (max-width: 600px) {
+    main { padding: 14px; }
+    .card { padding: 14px; border-radius: 10px; }
+    header { padding: 14px 16px; }
+
+    /* keep lanes horizontal (A/B labels are tiny) — just tighten the columns */
+    .lane { grid-template-columns: 34px 44px 1fr; }
+    .lane.ranked { grid-template-columns: 34px 44px 1fr; }
+    .lane-radio { border-right: none; }
+    .radio-dot { width: 16px; height: 16px; }
+    .lane-side { padding: 8px 4px; gap: 4px; }
+    .lane-head { gap: 6px; }
+    .wave-label .nm { font-size: 13px; }
+    canvas.waveform { height: 72px; }
+
+    /* transport wraps cleanly; drop the keyboard hint (no keyboard on mobile) */
+    .transport { gap: 12px; flex-wrap: wrap; }
+    .t-hint { display: none; }
+    .transport-play { width: 48px; height: 48px; }
+
+    /* pick buttons stack full-width and stay thumb-friendly */
+    .pick-row { grid-template-columns: 1fr; }
+    .pick-btn { padding: 18px; }
+  }
+
+  /* results lanes reuse the A/B lane layout; rank pill on top, name below */
+  .lane .rank-pill {
+    flex: 0 0 auto; width: 26px; height: 26px; border-radius: 50%;
+    display: grid; place-items: center; font-weight: 800; font-size: 13px;
+    background: var(--panel); border: 1px solid var(--border);
+  }
+  .lane.top1 .rank-pill { background: gold; color: #222; border-color: gold; }
+  .lane.top2 .rank-pill { background: #c0c7d1; color: #222; }
+  .lane.top3 .rank-pill { background: #cd7f32; color: #fff; }
+
+  .center { text-align: center; }
+  .muted { color: var(--muted); }
+  .err { color: #ff6b6b; }
+
+  .toolbar { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 8px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🎧 Audio Comparison</h1>
+  <span class="sub" id="headerSub">Pick a set to start ranking</span>
+</header>
+
+<main>
+  <!-- STEP 1: choose folder -->
+  <section id="step-select">
+    <div class="card">
+      <h2 style="margin-top:0;">Choose a comparison set</h2>
+      <div id="folderList" class="folder-list"><p class="muted">Loading…</p></div>
+      <p id="selectErr" class="err"></p>
+    </div>
+  </section>
+
+  <!-- STEP 2: compare -->
+  <section id="step-compare" class="hidden">
+    <div class="card">
+      <div style="display:flex;justify-content:space-between;align-items:baseline;">
+        <strong id="compareTitle"></strong>
+        <span class="muted" id="compareCount"></span>
+      </div>
+      <div class="progress-bar"><div class="progress-fill" id="progressFill"></div></div>
+      <p class="muted" style="margin-top:0">Press play, then click between A and B to A/B them at the same spot. Click anywhere on a waveform to jump there. When you've decided, pick the one you prefer.</p>
+
+      <div class="vs-wrap" id="vsWrap"></div>
+
+      <div class="transport">
+        <button class="transport-play" id="transportPlay" title="Play / pause both"></button>
+        <span class="t-time"><span id="tCur">0:00</span> / <span id="tDur">0:00</span></span>
+        <span class="t-hint">space = play/pause &nbsp;·&nbsp; ↑ / ↓ switch A·B &nbsp;·&nbsp; ← / → jump 2s</span>
+      </div>
+
+      <div class="pick-row" id="pickRow"></div>
+
+      <div class="toolbar center" style="justify-content:center;margin-top:18px;">
+        <button class="ghost" id="restartAll">↺ Start over</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- STEP 3: results -->
+  <section id="step-results" class="hidden">
+    <div class="card">
+      <h2 style="margin-top:0;">Final ranking</h2>
+      <p class="muted">Your ranking, best at the top. Click any track to hear it, or click a waveform to jump to a spot.</p>
+
+      <div class="vs-wrap" id="resultsLanes"></div>
+
+      <div class="transport">
+        <button class="transport-play" id="resultsPlay" title="Play / pause all"></button>
+        <span class="t-time"><span id="rCur">0:00</span> / <span id="rDur">0:00</span></span>
+        <span class="t-hint">space = play/pause &nbsp;·&nbsp; ← / → seek &nbsp;·&nbsp; ↑ / ↓ switch track</span>
+      </div>
+
+      <div class="toolbar" style="margin-top:18px;">
+        <button class="ghost" id="resultsRestart">Compare another set</button>
+      </div>
+    </div>
+  </section>
+</main>
+
+<script>
+"use strict";
+
+/* ------------------------------------------------------------------ *
+ * Config / helpers
+ * ------------------------------------------------------------------ */
+const AUDIO_ROOT = "audio/";
+
+// color palette for lanes. Colors are randomized every run so nobody can
+// remember "A was blue last time" — the mapping carries no information.
+const PALETTE = ["#5b8cff", "#ff7a59", "#46d39a", "#c879ff", "#ffd166", "#ff5d8f", "#3ec5e0", "#a3e635", "#ff9f43", "#7c83ff"];
+
+function shuffled(arr) {
+  const a = arr.slice();
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
+// strip anything inside parentheses (the hidden "answer") + extension
+function displayName(filename) {
+  return filename
+    .replace(/\.[^.]+$/, "")        // drop extension
+    .replace(/\s*\([^)]*\)\s*/g, " ") // drop (...) groups
+    .replace(/\s+/g, " ")
+    .trim() || filename.replace(/\.[^.]+$/, "");
+}
+function fmtTime(sec) {
+  if (!isFinite(sec)) return "0:00";
+  const m = Math.floor(sec / 60);
+  const s = Math.floor(sec % 60);
+  return m + ":" + String(s).padStart(2, "0");
+}
+async function listDir(url) {
+  const res = await fetch(url, { headers: { "Accept": "application/json" } });
+  if (!res.ok) throw new Error("HTTP " + res.status + " for " + url);
+  const json = await res.json(); // nginx autoindex JSON
+  return json;
+}
+
+/* ------------------------------------------------------------------ *
+ * Audio engine — ALL tracks play simultaneously in sync; the "active"
+ * track is the only audible one (volume 1), the rest are muted (volume 0).
+ * Switching A/B is just a volume swap, so there's zero playback glitch and
+ * the two stay sample-aligned. A single transport plays/pauses everything.
+ * ------------------------------------------------------------------ */
+const Engine = {
+  tracks: new Map(),     // key -> { audio, peaks, duration, canvas, draw, url }
+  order: [],             // keys, in lane order
+  activeKey: null,       // the audible one
+  playing: false,
+  audioCtx: null,
+  rafId: null,
+
+  getCtx() {
+    if (!this.audioCtx) this.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    return this.audioCtx;
+  },
+
+  // Shared playhead position — read from any track (they're synced); prefer active.
+  get sharedPos() {
+    const t = this.tracks.get(this.activeKey) || this.tracks.get(this.order[0]);
+    return t && isFinite(t.audio.currentTime) ? t.audio.currentTime : 0;
+  },
+  displayPos() { return this.sharedPos; },
+
+  duration() {
+    let d = 0;
+    for (const t of this.tracks.values()) d = Math.max(d, t.audio.duration || t.duration || 0);
+    return d;
+  },
+
+  startTicker() {
+    if (this.rafId != null) return;
+    const tick = () => {
+      this.redrawAll();
+      onTransportTick();
+      if (this.playing) this.rafId = requestAnimationFrame(tick);
+      else { this.rafId = null; this.redrawAll(); onTransportTick(); }
+    };
+    this.rafId = requestAnimationFrame(tick);
+  },
+
+  redrawAll() { for (const t of this.tracks.values()) if (t.draw) t.draw(); },
+
+  reset() {
+    for (const t of this.tracks.values()) {
+      try { t.audio.pause(); } catch (e) {}
+      t.audio.src = "";
+    }
+    this.tracks.clear();
+    this.order = [];
+    this.activeKey = null;
+    this.playing = false;
+    if (this.rafId != null) { cancelAnimationFrame(this.rafId); this.rafId = null; }
+  },
+
+  async load(key, url) {
+    if (this.tracks.has(key)) return this.tracks.get(key);
+    const audio = new Audio();
+    audio.preload = "auto";
+    // same-origin (page + audio both under /compare/), so no crossOrigin needed —
+    // setting it would impose a CORS requirement nginx may not satisfy and mute playback.
+    audio.src = url;
+
+    // Route through Web Audio so switching is a sample-accurate gain ramp
+    // (no zipper/click, and the streams stay sample-aligned). The element's
+    // own .volume stays 1; the GainNode does the muting.
+    const ctx = this.getCtx();
+    const srcNode = ctx.createMediaElementSource(audio);
+    const gain = ctx.createGain();
+    gain.gain.value = 0; // muted until chosen active
+    srcNode.connect(gain).connect(ctx.destination);
+
+    const track = { audio, srcNode, gain, peaks: null, duration: 0, canvas: null, draw: null, url };
+    this.tracks.set(key, track);
+    this.order.push(key);
+    if (this.activeKey == null) this.activeKey = key; // first lane audible by default
+
+    this.decode(url).then(({ peaks, duration }) => {
+      track.peaks = peaks;
+      track.duration = duration || track.duration;
+      if (track.draw) track.draw();
+    }).catch(() => { /* waveform optional */ });
+
+    return track;
+  },
+
+  async decode(url) {
+    const res = await fetch(url);
+    const buf = await res.arrayBuffer();
+    const audioBuf = await this.getCtx().decodeAudioData(buf);
+    const ch = audioBuf.getChannelData(0);
+    const BUCKETS = 800;
+    const block = Math.floor(ch.length / BUCKETS) || 1;
+    const peaks = new Float32Array(BUCKETS);
+    for (let i = 0; i < BUCKETS; i++) {
+      let max = 0;
+      const start = i * block;
+      for (let j = 0; j < block; j++) {
+        const v = Math.abs(ch[start + j] || 0);
+        if (v > max) max = v;
+      }
+      peaks[i] = max;
+    }
+    return { peaks, duration: audioBuf.duration };
+  },
+
+  // Equal-power-ish crossfade between tracks via short gain ramps — kills the
+  // click you get from flipping element.volume, and keeps streams aligned.
+  applyVolumes(rampMs) {
+    const ctx = this.getCtx();
+    const now = ctx.currentTime;
+    const t = (rampMs == null ? 18 : rampMs) / 1000;
+    for (const [k, tr] of this.tracks) {
+      if (!tr.gain) continue;
+      const target = (k === this.activeKey) ? 1 : 0;
+      const g = tr.gain.gain;
+      g.cancelScheduledValues(now);
+      g.setValueAtTime(g.value, now);
+      g.linearRampToValueAtTime(target, now + t);
+    }
+  },
+
+  // choose which track is audible — instant gain crossfade, no seek/restart
+  setActive(key) {
+    if (!this.tracks.has(key)) return;
+    if (this.audioCtx && this.audioCtx.state === "suspended") this.audioCtx.resume();
+    this.activeKey = key;
+    this.applyVolumes();
+    this.redrawAll();
+    onTransportTick();
+  },
+
+  // play/pause EVERYTHING together
+  togglePlay() { this.playing ? this.pauseAll() : this.playAll(); },
+
+  playAll(fromStart) {
+    if (this.audioCtx && this.audioCtx.state === "suspended") this.audioCtx.resume();
+    this.applyVolumes(0);
+    const startEach = (t) => {
+      if (fromStart) { try { t.audio.currentTime = 0; } catch (e) {} }
+      t.audio.play().catch(() => {});
+    };
+    for (const t of this.tracks.values()) {
+      if (t.audio.readyState >= 1) startEach(t);
+      else t.audio.addEventListener("canplay", () => startEach(t), { once: true });
+    }
+    this.playing = true;
+    this.resync();
+    this.startTicker();
+  },
+
+  pauseAll() {
+    for (const t of this.tracks.values()) t.audio.pause();
+    this.playing = false;
+    this.redrawAll();
+    onTransportTick();
+  },
+
+  // Force all tracks to the active track's clock so they stay aligned.
+  resync() {
+    const ref = this.tracks.get(this.activeKey);
+    if (!ref) return;
+    const pos = ref.audio.currentTime;
+    for (const [k, t] of this.tracks) {
+      if (k !== this.activeKey && Math.abs(t.audio.currentTime - pos) > 0.04) {
+        try { t.audio.currentTime = pos; } catch (e) {}
+      }
+    }
+  },
+
+  // move ALL tracks to an absolute position (they stay synced)
+  seekTo(pos) {
+    const dur = this.duration();
+    pos = Math.max(0, Math.min(dur, pos));
+    for (const t of this.tracks.values()) { try { t.audio.currentTime = pos; } catch (e) {} }
+    this.redrawAll();
+    onTransportTick();
+  },
+
+  // seek by ratio (0..1) of the duration
+  seek(ratio) { this.seekTo(ratio * this.duration()); },
+
+  // jump forward/back by N seconds (keyboard ←/→)
+  nudge(seconds) { this.seekTo(this.sharedPos + seconds); }
+};
+
+/* ------------------------------------------------------------------ *
+ * Waveform rendering
+ * ------------------------------------------------------------------ */
+function setupWaveform(track, canvas, color, getKey) {
+  track.canvas = canvas;
+  const dpr = window.devicePixelRatio || 1;
+  const cssVar = (n) => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+
+  function resize() {
+    const rect = canvas.getBoundingClientRect();
+    const w = Math.max(1, Math.floor(rect.width * dpr));
+    const h = Math.max(1, Math.floor(rect.height * dpr));
+    if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+  }
+  function draw() {
+    resize();
+    const ctx = canvas.getContext("2d");
+    const W = canvas.width, H = canvas.height;
+    ctx.clearRect(0, 0, W, H);
+
+    // Shared playhead — all lanes sweep in parallel (tracks are synced).
+    const dur = Engine.duration();
+    const pos = Engine.displayPos();
+    const playedRatio = dur ? Math.min(1, pos / dur) : 0;
+
+    const isActive = getKey() === Engine.activeKey;
+    const mid = H / 2;
+    const peaks = track.peaks;
+
+    if (!peaks) {
+      ctx.globalAlpha = isActive ? 1 : 0.4;
+      ctx.fillStyle = color;
+      ctx.fillRect(0, mid - 1, W, 2);
+      ctx.globalAlpha = 1;
+    } else {
+      const n = peaks.length;
+      const barW = W / n;
+      for (let i = 0; i < n; i++) {
+        const h = Math.max(1, peaks[i] * (H * 0.9));
+        const x = i * barW;
+        const played = (i / n) <= playedRatio;
+        // muted lane is dim; played portion of the active lane is full, unplayed a bit softer
+        ctx.globalAlpha = isActive ? (played ? 1 : 0.45) : (played ? 0.35 : 0.18);
+        ctx.fillStyle = color;
+        ctx.fillRect(x, mid - h / 2, Math.max(1, barW - 0.5), h);
+      }
+      ctx.globalAlpha = 1;
+    }
+
+    // vertical playhead line (white-ish, full opacity on every lane so they read together)
+    const px = Math.round(playedRatio * W) + 0.5;
+    ctx.fillStyle = isActive ? "#ffffff" : "rgba(255,255,255,.4)";
+    ctx.fillRect(px - 1, 0, 2, H);
+
+    // hover bar — only on the track currently being hovered (restricted to this lane)
+    if (track.hoverRatio != null) {
+      const hx = Math.round(track.hoverRatio * W) + 0.5;
+      ctx.fillStyle = color;
+      ctx.globalAlpha = 0.9;
+      ctx.fillRect(hx - 1, 0, 2, H);
+      ctx.globalAlpha = 1;
+    }
+  }
+  track.draw = draw;
+
+  // hover handling lives here so the bar is restricted to this canvas
+  canvas.addEventListener("pointermove", (ev) => {
+    const rect = canvas.getBoundingClientRect();
+    track.hoverRatio = Math.max(0, Math.min(1, (ev.clientX - rect.left) / rect.width));
+    draw();
+  });
+  canvas.addEventListener("pointerleave", () => { track.hoverRatio = null; draw(); });
+
+  draw();
+  window.addEventListener("resize", draw);
+  return draw;
+}
+
+/* ------------------------------------------------------------------ *
+ * Comparison-driven merge sort (binary outcomes, full ranking)
+ * ------------------------------------------------------------------ */
+class ComparisonSorter {
+  constructor(items) {
+    this.items = items;            // [{file, name, key, url}]
+    this.pending = null;           // {a, b, resolve}
+    this.totalComparisons = 0;
+    this.doneComparisons = 0;
+    this._estimateTotal();
+  }
+  _estimateTotal() {
+    const n = this.items.length;
+    this.estTotal = n <= 1 ? 0 : Math.ceil(n * Math.log2(n));
+  }
+  // ask user to compare; returns a promise of the chosen item
+  _ask(a, b) {
+    return new Promise((resolve) => {
+      this.pending = { a, b, resolve };
+      renderComparison(a, b, (winner) => {
+        this.doneComparisons++;
+        const p = this.pending;
+        this.pending = null;
+        p.resolve(winner);
+      });
+    });
+  }
+  async sort() {
+    const result = await this._mergeSort(this.items.slice());
+    return result; // best first
+  }
+  async _mergeSort(arr) {
+    if (arr.length <= 1) return arr;
+    const mid = Math.floor(arr.length / 2);
+    const left = await this._mergeSort(arr.slice(0, mid));
+    const right = await this._mergeSort(arr.slice(mid));
+    return this._merge(left, right);
+  }
+  async _merge(left, right) {
+    const out = [];
+    let i = 0, j = 0;
+    while (i < left.length && j < right.length) {
+      const winner = await this._ask(left[i], right[j]); // "preferred" = ranked higher
+      if (winner === left[i]) out.push(left[i++]);
+      else out.push(right[j++]);
+    }
+    while (i < left.length) out.push(left[i++]);
+    while (j < right.length) out.push(right[j++]);
+    return out;
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ * UI flow
+ * ------------------------------------------------------------------ */
+const els = {
+  stepSelect: document.getElementById("step-select"),
+  stepCompare: document.getElementById("step-compare"),
+  stepResults: document.getElementById("step-results"),
+  folderList: document.getElementById("folderList"),
+  selectErr: document.getElementById("selectErr"),
+  vsWrap: document.getElementById("vsWrap"),
+  compareTitle: document.getElementById("compareTitle"),
+  compareCount: document.getElementById("compareCount"),
+  progressFill: document.getElementById("progressFill"),
+  headerSub: document.getElementById("headerSub"),
+  tCur: document.getElementById("tCur"),
+  tDur: document.getElementById("tDur"),
+  transportPlay: document.getElementById("transportPlay"),
+  pickRow: document.getElementById("pickRow"),
+  resultsLanes: document.getElementById("resultsLanes"),
+  resultsPlay: document.getElementById("resultsPlay"),
+  rCur: document.getElementById("rCur"),
+  rDur: document.getElementById("rDur"),
+};
+
+// crisp, perfectly-centered transport icons (no unicode-glyph baseline jank)
+const ICON_PLAY  = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg>';
+const ICON_PAUSE = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 5h4v14H6zM14 5h4v14h-4z"/></svg>';
+
+// Keeps the transport readout + play button + lane state in sync with the engine.
+// Defined here (not inside renderComparison) because the Engine references it.
+// Works for whichever screen owns the current lanes (compare or results).
+function onTransportTick() {
+  const cur = fmtTime(Engine.sharedPos), dur = fmtTime(Engine.duration());
+  const icon = Engine.playing ? ICON_PAUSE : ICON_PLAY;
+  if (els.tCur) els.tCur.textContent = cur;
+  if (els.tDur) els.tDur.textContent = dur;
+  if (els.transportPlay) els.transportPlay.innerHTML = icon;
+  if (els.rCur) els.rCur.textContent = cur;
+  if (els.rDur) els.rDur.textContent = dur;
+  if (els.resultsPlay) els.resultsPlay.innerHTML = icon;
+
+  for (const lane of document.querySelectorAll(".lane")) {
+    const active = lane.dataset.key === Engine.activeKey;
+    lane.classList.toggle("active-audio", active);
+    lane.classList.toggle("is-playing", active && Engine.playing);
+  }
+}
+let currentFolder = null;
+let sorter = null;
+
+function show(step) {
+  els.stepSelect.classList.toggle("hidden", step !== "select");
+  els.stepCompare.classList.toggle("hidden", step !== "compare");
+  els.stepResults.classList.toggle("hidden", step !== "results");
+}
+
+async function init() {
+  try {
+    const entries = await listDir(AUDIO_ROOT);
+    const dirs = entries.filter(e => e.type === "directory");
+    els.folderList.innerHTML = "";
+    if (!dirs.length) {
+      els.folderList.innerHTML = '<p class="muted">No comparison sets found in /audio.</p>';
+      return;
+    }
+    for (const d of dirs) {
+      const btn = document.createElement("button");
+      btn.className = "folder-btn";
+      btn.textContent = d.name;
+      btn.addEventListener("click", () => startSet(d.name));
+      els.folderList.appendChild(btn);
+    }
+  } catch (e) {
+    els.selectErr.textContent = "Couldn't load /audio listing: " + e.message;
+  }
+}
+
+async function startSet(folder) {
+  currentFolder = folder;
+  els.selectErr.textContent = "";
+  Engine.reset();
+  try {
+    const entries = await listDir(AUDIO_ROOT + encodeURIComponent(folder) + "/");
+    const files = entries
+      .filter(e => e.type === "file" && /\.(mp3|wav|ogg|m4a|flac|aac)$/i.test(e.name));
+    if (files.length < 2) {
+      els.selectErr.textContent = "Need at least 2 audio files to compare in \"" + folder + "\".";
+      return;
+    }
+    const items = files.map((f, idx) => ({
+      file: f.name,
+      name: displayName(f.name),
+      key: folder + "::" + f.name,
+      url: AUDIO_ROOT + encodeURIComponent(folder) + "/" + encodeURIComponent(f.name),
+      idx
+    }));
+
+    els.compareTitle.textContent = folder;
+    els.headerSub.textContent = folder;
+
+    sorter = new ComparisonSorter(items);
+    show("compare");
+    const ranked = await sorter.sort();
+    showResults(ranked);
+  } catch (e) {
+    show("select");
+    els.selectErr.textContent = "Couldn't load \"" + folder + "\": " + e.message;
+  }
+}
+
+function cssVarColor(name) {
+  return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+}
+
+// Build one stacked lane: radio column | label column | waveform.
+// `opts` = { key, url, color, extraClass, headHTML, sideHTML }
+// headHTML goes on the top line of the label column; sideHTML (optional) below it.
+// Wires: radio/lane click = switch active; waveform click = seek; hover bar.
+function buildLane(opts) {
+  const lane = document.createElement("div");
+  lane.className = "lane " + (opts.extraClass || "");
+  lane.dataset.key = opts.key;
+  lane.style.setProperty("--c", opts.color);
+
+  lane.innerHTML = `
+    <div class="lane-radio"><span class="radio-dot"></span></div>
+    <div class="lane-side">
+      <div class="lane-head">${opts.headHTML}</div>
+      ${opts.sideHTML || ""}
+    </div>
+    <div class="waveform-wrap">
+      ${opts.topHTML ? `<div class="wave-label">${opts.topHTML}</div>` : ""}
+      <canvas class="waveform"></canvas>
+    </div>
+  `;
+
+  const canvas = lane.querySelector("canvas.waveform");
+
+  Engine.load(opts.key, opts.url).then((track) => {
+    setupWaveform(track, canvas, opts.color, () => opts.key);
+    track.audio.addEventListener("loadedmetadata", onTransportTick);
+    track.audio.addEventListener("durationchange", onTransportTick);
+    track.audio.addEventListener("ended", () => Engine.pauseAll());
+    onTransportTick();
+
+    // waveform click = switch to this track, seek to that spot, and start
+    // playing from there if we're currently paused
+    canvas.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      Engine.setActive(opts.key);
+      const rect = canvas.getBoundingClientRect();
+      Engine.seek((ev.clientX - rect.left) / rect.width);
+      if (!Engine.playing) Engine.playAll();
+    });
+  });
+
+  // click anywhere in the lane (radio, label, empty space) = make it audible
+  lane.addEventListener("click", (ev) => {
+    if (ev.target.closest("button")) return;            // let inner buttons act
+    if (ev.target.closest("canvas.waveform")) return;   // waveform = seek, handled above
+    Engine.setActive(opts.key);
+  });
+
+  return lane;
+}
+
+// Render one A-vs-B comparison. Names stay secret — lanes show only "A" / "B".
+function renderComparison(a, b, onPick) {
+  const pct = sorter.estTotal ? Math.min(100, Math.round(sorter.doneComparisons / sorter.estTotal * 100)) : 0;
+  els.progressFill.style.width = pct + "%";
+  const n = sorter.doneComparisons + 1;
+  els.compareCount.textContent = "comparison " + n + " of " + Math.max(n, sorter.estTotal);
+
+  Engine.reset();
+  els.vsWrap.innerHTML = "";
+  els.pickRow.innerHTML = "";
+
+  // A is always blue, B is always red — consistent so they're easy to track
+  const sides = [
+    { item: a, letter: "A", cls: "a", color: cssVarColor("--wave-a") },
+    { item: b, letter: "B", cls: "b", color: cssVarColor("--wave-b") },
+  ];
+
+  for (const side of sides) {
+    const lane = buildLane({
+      key: side.item.key,
+      url: side.item.url,
+      color: side.color,
+      extraClass: side.cls,
+      headHTML: `<span class="badge">${side.letter}</span>`, // letter only — no name
+    });
+    els.vsWrap.appendChild(lane);
+
+    const pick = document.createElement("button");
+    pick.className = "pick-btn " + side.cls;
+    pick.textContent = "Prefer " + side.letter;
+    pick.addEventListener("click", () => { Engine.pauseAll(); onPick(side.item); });
+    els.pickRow.appendChild(pick);
+  }
+
+  Engine.activeKey = a.key; // A audible by default
+  onTransportTick();
+
+  // Autoplay the new matchup. After a "Prefer" click we're inside a user
+  // gesture so the browser allows it; on the very first matchup (no gesture
+  // yet) the play() call is silently blocked and the user just hits ▶.
+  const startWhenReady = () => Engine.playAll();
+  const refTrack = Engine.tracks.get(a.key);
+  if (refTrack && refTrack.audio.readyState >= 2) startWhenReady();
+  else if (refTrack) refTrack.audio.addEventListener("canplay", startWhenReady, { once: true });
+}
+
+// Results — same DAW lanes, one per ranked item, top = most preferred.
+// The big reveal: real names are shown outright here.
+function showResults(ranked) {
+  Engine.reset();
+  els.headerSub.textContent = currentFolder + " — ranked!";
+  els.resultsLanes.innerHTML = "";
+
+  const colors = shuffled(PALETTE); // random rank→color mapping each run
+  ranked.forEach((item, i) => {
+    const color = colors[i % colors.length];
+    const rankCls = i === 0 ? "top1" : i === 1 ? "top2" : i === 2 ? "top3" : "";
+    const realName = item.file.replace(/\.[^.]+$/, ""); // real filename, sans extension
+    const lane = buildLane({
+      key: item.key,
+      url: item.url,
+      color,
+      extraClass: "ranked " + rankCls,
+      headHTML: `<span class="rank-pill">${i + 1}</span>`,        // radio + number, fixed left column
+      topHTML: `<span class="nm">${escapeHtml(realName)}</span>`,  // name above the waveform
+    });
+    els.resultsLanes.appendChild(lane);
+  });
+
+  Engine.activeKey = ranked[0] ? ranked[0].key : null; // #1 audible by default
+  onTransportTick();
+  show("results");
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+  }[c]));
+}
+
+/* buttons */
+els.transportPlay.addEventListener("click", () => Engine.togglePlay());
+els.resultsPlay.addEventListener("click", () => Engine.togglePlay());
+
+document.getElementById("restartAll").addEventListener("click", () => {
+  Engine.reset(); show("select"); els.headerSub.textContent = "Pick a set to start ranking";
+});
+document.getElementById("resultsRestart").addEventListener("click", () => {
+  Engine.reset(); show("select"); els.headerSub.textContent = "Pick a set to start ranking";
+});
+
+// keyboard (compare & results screens):
+//   space = play/pause · ←/→ = jump back/ahead 2s · ↑/↓ = switch track
+const NUDGE_SECONDS = 2;
+document.addEventListener("keydown", (e) => {
+  const onCompare = !els.stepCompare.classList.contains("hidden");
+  const onResults = !els.stepResults.classList.contains("hidden");
+  if (!onCompare && !onResults) return;
+
+  const order = Engine.order;
+  if (e.code === "Space") { e.preventDefault(); Engine.togglePlay(); }
+  else if (e.key === "ArrowLeft")  { e.preventDefault(); Engine.nudge(-NUDGE_SECONDS); }
+  else if (e.key === "ArrowRight") { e.preventDefault(); Engine.nudge(NUDGE_SECONDS); }
+  else if (e.key === "ArrowUp" && order.length) {
+    e.preventDefault();
+    const i = Math.max(0, order.indexOf(Engine.activeKey));
+    Engine.setActive(order[(i - 1 + order.length) % order.length]);
+  } else if (e.key === "ArrowDown" && order.length) {
+    e.preventDefault();
+    const i = Math.max(0, order.indexOf(Engine.activeKey));
+    Engine.setActive(order[(i + 1) % order.length]);
+  }
+});
+
+init();
+</script>
+</body>
+</html>
