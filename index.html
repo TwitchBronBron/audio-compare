@@ -185,6 +185,31 @@
     vertical-align: middle; white-space: nowrap;
   }
 
+  /* debug panel (?debug=true) — live rating-engine internals */
+  .debug-panel {
+    margin-top: 22px; padding: 12px 14px; border: 1px solid var(--accent-2);
+    border-radius: 8px; background: rgba(0,0,0,.25); text-align: left;
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  .debug-head {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 12px; margin-bottom: 10px;
+  }
+  .debug-panel table { border-collapse: collapse; width: 100%; font-size: 11px; }
+  .debug-panel th, .debug-panel td {
+    padding: 2px 8px; text-align: right; white-space: nowrap;
+    border-bottom: 1px solid rgba(255,255,255,.06);
+  }
+  .debug-panel th:first-child, .debug-panel td:first-child { text-align: left; }
+  .debug-panel th { color: var(--muted); font-weight: 700; }
+  .debug-panel caption {
+    text-align: left; color: var(--accent-2); font-weight: 700;
+    margin: 10px 0 4px; font-size: 12px;
+  }
+  .debug-panel tr.is-tie td { color: var(--accent-2); }
+  .debug-panel tr.low-gate td { opacity: .5; }
+  .debug-panel .dbg-warn { color: #ff8080; font-weight: 700; }
+
   /* shared transport bar under the lanes */
   .transport {
     display: flex; align-items: center; gap: 16px;
@@ -201,6 +226,20 @@
   .transport-play:focus { outline: none; }
   .transport-play:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }
   .transport-play svg { width: 22px; height: 22px; display: block; fill: currentColor; }
+  /* mute toggle — smaller, neutral, sits beside the play button */
+  .transport-mute {
+    width: 40px; height: 40px; border-radius: 50%; padding: 0;
+    background: var(--panel, #2a2d36); color: var(--muted);
+    border: 1px solid rgba(255,255,255,.14);
+    display: grid; place-items: center; flex: 0 0 auto;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .transport-mute:hover { color: #fff; border-color: rgba(255,255,255,.3); }
+  .transport-mute:focus { outline: none; }
+  .transport-mute:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }
+  .transport-mute svg { width: 18px; height: 18px; display: block; fill: currentColor; }
+  /* when muted, draw attention with the accent-2 color */
+  .transport-mute.is-muted { color: var(--accent-2); border-color: var(--accent-2); }
   .t-time { font-variant-numeric: tabular-nums; color: var(--muted); font-size: 14px; }
   .t-hint {
     color: var(--muted); font-size: 13px; margin-top: 8px;
@@ -287,12 +326,13 @@
         <span class="mark m-better" title="better"></span>
         <span class="mark m-best"  title="best"></span>
       </div>
-      <p class="muted" style="margin-top:0">Press play, then click between A and B to A/B them at the same spot. Click anywhere on a waveform to jump there. When you've decided, pick the one you prefer. The bar fills as your ranking becomes statistically settled — vote as many times as you like, then hit <strong>Show my ranking</strong>.</p>
+      <p class="muted" style="margin-top:0">Press play, then click between A and B to A/B them at the same spot. Click anywhere on a waveform to jump there. When you've decided, pick the one you prefer. The bar fills as your ranking becomes statistically settled — vote as many times as you like, then hit <strong>Show results</strong>.</p>
 
       <div class="vs-wrap" id="vsWrap"></div>
 
       <div class="transport">
         <button class="transport-play" id="transportPlay" title="Play / pause both"></button>
+        <button class="transport-mute" id="transportMute" title="Mute / unmute"></button>
         <span class="t-time"><span id="tCur">0:00</span> / <span id="tDur">0:00</span></span>
       </div>
       <div class="t-hint">
@@ -304,13 +344,23 @@
       <div class="pick-row" id="pickRow"></div>
 
       <div class="toolbar center" style="justify-content:center;margin-top:16px;">
-        <button class="primary" id="finishRanking">✓ Show my ranking</button>
+        <button class="primary" id="finishRanking">✓ Show results</button>
       </div>
 
       <div class="toolbar center" style="justify-content:center;margin-top:18px;">
         <button class="ghost" id="shareTest">🔗 Copy test link</button>
         <button class="ghost" id="compareBack">← Back to all sets</button>
         <button class="ghost" id="restartAll">↺ Start over</button>
+      </div>
+
+      <!-- DEBUG panel — only rendered when ?debug=true. Live view of the rating
+           engine's internals + a one-click diagnostic copy for bug reports. -->
+      <div id="debugPanel" class="debug-panel hidden">
+        <div class="debug-head">
+          <strong>🔬 rating engine — live state</strong>
+          <button class="ghost" id="debugCopy" type="button">📋 Copy diagnostic</button>
+        </div>
+        <div id="debugBody"></div>
       </div>
     </div>
   </section>
@@ -325,6 +375,7 @@
 
       <div class="transport">
         <button class="transport-play" id="resultsPlay" title="Play / pause all"></button>
+        <button class="transport-mute" id="resultsMute" title="Mute / unmute"></button>
         <span class="t-time"><span id="rCur">0:00</span> / <span id="rDur">0:00</span></span>
       </div>
       <div class="t-hint">
@@ -343,6 +394,9 @@
   </section>
 </main>
 
+<!-- Pure rating math (Bradley–Terry MLE + precision). Shared, unit-tested core;
+     run `node compare/preference-rating.js` to exercise its test suite. -->
+<script src="preference-rating.js"></script>
 <script>
 "use strict";
 
@@ -428,6 +482,18 @@ const Engine = {
   playing: false,
   audioCtx: null,
   rafId: null,
+  // global mute — persisted across reloads (see MUTE_KEY). The active track's
+  // gain target is multiplied by (muted ? 0 : 1), so mute composes with the
+  // normal A/B gain crossfade without disturbing which track is "active".
+  muted: (function () { try { return localStorage.getItem("audiocompare:muted") === "1"; } catch (e) { return false; } })(),
+
+  setMuted(on) {
+    this.muted = !!on;
+    try { localStorage.setItem("audiocompare:muted", this.muted ? "1" : "0"); } catch (e) {}
+    this.applyVolumes(0);   // instant, no ramp — feels like a real mute switch
+    onTransportTick();      // refresh the mute button icons
+  },
+  toggleMute() { this.setMuted(!this.muted); },
 
   getCtx() {
     if (!this.audioCtx) this.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
@@ -531,7 +597,7 @@ const Engine = {
     const t = (rampMs == null ? 18 : rampMs) / 1000;
     for (const [k, tr] of this.tracks) {
       if (!tr.gain) continue;
-      const target = (k === this.activeKey) ? 1 : 0;
+      const target = (k === this.activeKey && !this.muted) ? 1 : 0;
       const g = tr.gain.gain;
       g.cancelScheduledValues(now);
       g.setValueAtTime(g.value, now);
@@ -682,219 +748,56 @@ function setupWaveform(track, canvas, color, getKey) {
 }
 
 /* ------------------------------------------------------------------ *
- * Bradley–Terry preference rating (noise-tolerant, single voter)
+ * Bradley–Terry preference rating — UI WRAPPER
  * ------------------------------------------------------------------ *
  *
- * Instead of a brittle merge sort (each pair compared once, cached forever,
- * total order assumed), we fit a Bradley–Terry model to the FULL vote history
- * after every vote. BT is the statistical model behind Elo/Glicko — but since
- * we have only 3–8 items and store every vote, we fit the real model directly
- * rather than the online RD-decay approximation Glicko uses for chess
- * populations (that approximation has a sticky uncertainty floor that, at this
- * scale, made the confidence bar effectively never move — that was the bug).
+ * All the statistics live in preference-rating.js (window.PreferenceCore),
+ * which has its own unit-test suite (`node compare/preference-rating.js`).
+ * This wrapper is ONLY the serve/render loop: it owns the audio items, drives
+ * the comparison UI, and forwards votes into the pure core. Keeping the math
+ * in a separate, tested module is deliberate — the ranking must be trustworthy.
  *
- * Each item i has a latent strength θ_i (log scale). The model says
- *   P(i beats j) = 1 / (1 + e^-(θ_i - θ_j)).
- * We find the θ that maximize the likelihood of your votes via the standard MM
- * (minorization–maximization) iteration — a few dozen cheap iterations.
+ * `PreferenceRater` mirrors the small surface the rest of this file uses:
+ *   .replay(log) .record(cb) .run() .finish() .ranking() .precision() .voteCount
+ * and re-exports the core's statics (SCALE/Z/SEP_Z/sepZ) for the results UI.
  *
- * UNCERTAINTY comes straight from the data: an item's standard error shrinks as
- * you vote on it more and as your votes are more consistent. Flip-flop on a pair
- * and their strengths sit near-equal with wide overlapping error bars — exactly
- * the "you don't really have a preference here" signal. No RD schedule, no floor.
- *
- * Significance of "A ranks above B" = z-score on the strength difference,
- * (θA-θB)/SE_diff. The precision bar blends average pairwise separation with
- * total evidence so every consistent vote visibly moves it (smooth progress),
- * reaching 100% only when the whole ordering is solidly separated.
- *
- * Matchups are chosen semi-randomly, weighted toward close + under-sampled
- * pairs. Sampling is unbiased — which pairs you see affects only how FAST
- * confidence grows, never the ranking — so randomness costs nothing but variety.
+ * ranking() rows here carry the full {item} object (the UI needs name/url),
+ * layered on top of the core's {key, theta, se, r, rd, lo, hi}.
  */
 
+const PreferenceCore = window.PreferenceCore;
+
 class PreferenceRater {
+  // re-export the core's statics so existing call sites (PreferenceRater.sepZ,
+  // .SCALE, .Z, .SEP_Z, .MIN_DIRECT) keep working unchanged.
+  static get SCALE() { return PreferenceCore.SCALE; }
+  static get Z() { return PreferenceCore.Z; }
+  static get SEP_Z() { return PreferenceCore.SEP_Z; }
+  static get MIN_DIRECT() { return PreferenceCore.MIN_DIRECT; }
+  static sepZ(a, b) { return PreferenceCore.sepZ(a, b); }
+
   constructor(items) {
-    this.items = items;             // [{file, name, key, url}]
-    this.keys = items.map(it => it.key);
-    this.idx = new Map(this.keys.map((k, i) => [k, i]));
-    this.n = items.length;
-    this.pending = null;            // {a, b}
-    this.voteCount = 0;
-
-    // wins[i][j] = number of times item i was preferred over item j
-    this.wins = Array.from({ length: this.n }, () => new Array(this.n).fill(0));
-    // games[i][j] = total comparisons between i and j (symmetric)
-    this.games = Array.from({ length: this.n }, () => new Array(this.n).fill(0));
-
-    // fitted strengths (log scale) + standard errors, recomputed after each vote
-    this.theta = new Array(this.n).fill(0);
-    this.se = new Array(this.n).fill(Infinity);
-
+    this.items = items;                       // [{file, name, key, url}]
+    this.itemByKey = new Map(items.map(it => [it.key, it]));
+    this.core = new PreferenceCore(items.map(it => it.key));
+    this.pending = null;                      // {a, b}
     this._resolveDone = null;
     this._running = false;
   }
 
-  // We report strengths on a familiar Elo-ish scale for display: rating = 1500 +
-  // SCALE·θ. Purely cosmetic; all significance math is done on θ directly.
-  static get SCALE() { return 400 / Math.LN10; }  // matches Elo's 400/ln10 slope
-  static get Z() { return 1.96; }                 // ±95% display interval
-  static get SEP_Z() { return 1.64; }             // one-sided ~95% "separated" threshold
+  get voteCount() { return this.core.voteCount; }
 
-  // significance of A over B as a z-score on the strength difference
-  static sepZ(a, b) {
-    // accepts either a fitted row {theta, se} or a saved snapshot {r, rd}
-    const ta = a.theta != null ? a.theta : (a.r - 1500) / PreferenceRater.SCALE;
-    const tb = b.theta != null ? b.theta : (b.r - 1500) / PreferenceRater.SCALE;
-    const sea = a.se != null ? a.se : (a.rd / PreferenceRater.Z) / PreferenceRater.SCALE;
-    const seb = b.se != null ? b.se : (b.rd / PreferenceRater.Z) / PreferenceRater.SCALE;
-    const sd = Math.sqrt(sea * sea + seb * seb) || 1e-9;
-    return (ta - tb) / sd;
-  }
+  replay(log) { this.core.replay(log); }
 
-  _record(iWin, iLose) {
-    this.wins[iWin][iLose]++;
-    this.games[iWin][iLose]++;
-    this.games[iLose][iWin]++;
-    this.voteCount++;
-  }
-
-  // load a prior vote log (array of {a, b, winner}) into the win/games matrices
-  replay(log) {
-    for (const v of log) {
-      const wi = this.idx.get(v.winner);
-      const oi = this.idx.get(v.winner === v.a ? v.b : v.a);
-      if (wi == null || oi == null) continue;
-      this._record(wi, oi);
-    }
-    this._fit();
-  }
-
-  // ---- Bradley–Terry MLE via MM iteration ----------------------------------
-  // Add a tiny symmetric pseudo-count (a Bayesian prior) so the fit is always
-  // defined — even before any votes, or for an item that has only ever won/lost.
-  // The prior also keeps SEs finite and is what makes the bar start near 0 and
-  // climb smoothly rather than being undefined then snapping.
-  _fit() {
-    const n = this.n, PRIOR = 0.5;
-    // effective win/game counts including the prior (acts like half a win + half
-    // a loss against a phantom average opponent for every pair)
-    const W = [], N = [];
-    for (let i = 0; i < n; i++) {
-      W[i] = 0;
-      N[i] = [];
-      for (let j = 0; j < n; j++) {
-        N[i][j] = i === j ? 0 : this.games[i][j] + 2 * PRIOR;
-        if (i !== j) W[i] += this.wins[i][j] + PRIOR;
-      }
-    }
-
-    // strengths p_i = e^θ_i ; iterate MM updates, then renormalize (geometric mean = 1)
-    let p = new Array(n).fill(1);
-    for (let iter = 0; iter < 200; iter++) {
-      const np = new Array(n).fill(0);
-      for (let i = 0; i < n; i++) {
-        let denom = 0;
-        for (let j = 0; j < n; j++) {
-          if (i === j) continue;
-          denom += N[i][j] / (p[i] + p[j]);
-        }
-        np[i] = denom > 0 ? W[i] / denom : p[i];
-      }
-      // normalize to geometric mean 1 to keep things stable
-      let logsum = 0;
-      for (let i = 0; i < n; i++) logsum += Math.log(np[i]);
-      const gm = Math.exp(logsum / n);
-      let maxRel = 0;
-      for (let i = 0; i < n; i++) {
-        np[i] /= gm;
-        maxRel = Math.max(maxRel, Math.abs(np[i] - p[i]) / (p[i] || 1));
-      }
-      p = np;
-      if (maxRel < 1e-9) break;
-    }
-
-    this.theta = p.map(v => Math.log(v));
-
-    // ---- standard errors from the Fisher information --------------------------
-    // For BT, the observed information for θ_i (with others fixed) is
-    //   I_ii = Σ_j N_ij · P_ij · (1 - P_ij),  where P_ij = p_i/(p_i+p_j).
-    // SE_i ≈ 1/√I_ii. This shrinks as you play i more (bigger N) and is largest
-    // for near-50/50 (P≈0.5) opponents — i.e. uncertainty tracks evidence directly.
-    for (let i = 0; i < n; i++) {
-      let info = 0;
-      for (let j = 0; j < n; j++) {
-        if (i === j) continue;
-        const Pij = p[i] / (p[i] + p[j]);
-        info += N[i][j] * Pij * (1 - Pij);
-      }
-      this.se[i] = info > 0 ? 1 / Math.sqrt(info) : Infinity;
-    }
-  }
-
-  // current ranking, best first, with display rating + interval bounds
+  // current ranking, best first, each row augmented with its full item
   ranking() {
-    return this.items
-      .map((it, k) => {
-        const i = this.idx.get(it.key);
-        const r = 1500 + PreferenceRater.SCALE * this.theta[i];
-        const rd = PreferenceRater.Z * PreferenceRater.SCALE * (isFinite(this.se[i]) ? this.se[i] : 3);
-        return { item: it, theta: this.theta[i], se: this.se[i], r, rd, lo: r - rd, hi: r + rd };
-      })
-      .sort((x, y) => y.theta - x.theta);
+    return this.core.ranking().map(row => ({
+      ...row,
+      item: this.itemByKey.get(row.key),
+    }));
   }
 
-  // Smooth precision in [0,1]: every adjacent pair contributes how far its
-  // separation z-score has progressed toward the SEP_Z threshold (capped at 1),
-  // averaged across the ranking. So partial progress on every pair shows up, and
-  // the bar only reaches 100% when ALL neighbors are fully separated.
-  precision() {
-    const rk = this.ranking();
-    if (rk.length < 2) return 1;
-    let sum = 0;
-    for (let i = 0; i < rk.length - 1; i++) {
-      const z = PreferenceRater.sepZ(rk[i], rk[i + 1]);
-      sum += Math.max(0, Math.min(1, z / PreferenceRater.SEP_Z));
-    }
-    return sum / (rk.length - 1);
-  }
-
-  // Semi-random next matchup. Build a weight for every pair that favors pairs
-  // that are (a) statistically close and (b) under-sampled, then sample one pair
-  // at random in proportion to weight. Real randomness → good variety; the
-  // weighting → still spends extra attention where confidence is low.
-  nextPair() {
-    const rk = this.ranking();                 // sorted; lets us bias toward adjacency
-    const pos = new Map(rk.map((row, r) => [row.item.key, r]));
-    const pairs = [];
-    let total = 0;
-    for (let i = 0; i < this.n; i++) {
-      for (let j = i + 1; j < this.n; j++) {
-        const ki = this.keys[i], kj = this.keys[j];
-        const g = this.games[i][j];
-        // closeness: how far this pair still is from being resolved (1 = totally
-        // unresolved, →0 as it separates). Built from the same z-score.
-        const a = rk[pos.get(ki)], b = rk[pos.get(kj)];
-        const z = Math.abs(PreferenceRater.sepZ(a, b));
-        const closeness = Math.max(0.05, 1 - Math.min(1, z / PreferenceRater.SEP_Z));
-        // under-sampling: fewer prior games → higher weight
-        const undersampled = 1 / (1 + g);
-        // adjacency bonus: neighbors in the current order are most informative
-        const adjacency = 1 / (1 + Math.abs(pos.get(ki) - pos.get(kj)));
-        // blend, then keep a floor of randomness so ANY pair can come up
-        const w = 0.15 + closeness * 1.0 + undersampled * 1.0 + adjacency * 0.5;
-        pairs.push({ i, j, w });
-        total += w;
-      }
-    }
-    // weighted random draw
-    let pick = pairs[0];
-    let roll = Math.random() * total;
-    for (const pr of pairs) { roll -= pr.w; if (roll <= 0) { pick = pr; break; } }
-    const itA = this.items[pick.i], itB = this.items[pick.j];
-    // randomize which side is shown as A vs B so position carries no signal
-    return Math.random() < 0.5 ? [itA, itB] : [itB, itA];
-  }
+  precision() { return this.core.precision(); }
 
   run() {
     this._running = true;
@@ -914,13 +817,11 @@ class PreferenceRater {
 
   _serveNext() {
     if (!this._running) return;
-    const [a, b] = this.nextPair();
+    const [ka, kb] = this.core.nextPair();
+    const a = this.itemByKey.get(ka), b = this.itemByKey.get(kb);
     this.pending = { a, b };
     renderComparison(a, b, (winner) => {
-      const wi = this.idx.get(winner.key);
-      const oi = this.idx.get(winner === a ? b.key : a.key);
-      this._record(wi, oi);
-      this._fit();
+      this.core.vote(a.key, b.key, winner.key);
       if (this.record) this.record(a.key, b.key, winner.key);
       this.pending = null;
       if (this._running) this._serveNext();
@@ -945,9 +846,11 @@ const els = {
   tCur: document.getElementById("tCur"),
   tDur: document.getElementById("tDur"),
   transportPlay: document.getElementById("transportPlay"),
+  transportMute: document.getElementById("transportMute"),
   pickRow: document.getElementById("pickRow"),
   resultsLanes: document.getElementById("resultsLanes"),
   resultsPlay: document.getElementById("resultsPlay"),
+  resultsMute: document.getElementById("resultsMute"),
   rCur: document.getElementById("rCur"),
   rDur: document.getElementById("rDur"),
 };
@@ -955,6 +858,9 @@ const els = {
 // crisp, perfectly-centered transport icons (no unicode-glyph baseline jank)
 const ICON_PLAY  = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg>';
 const ICON_PAUSE = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 5h4v14H6zM14 5h4v14h-4z"/></svg>';
+// speaker-with-waves (unmuted) and speaker-with-x (muted)
+const ICON_UNMUTE = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3a4.5 4.5 0 0 0-2.5-4.03v8.05A4.5 4.5 0 0 0 16.5 12zM14 3.23v2.06a7 7 0 0 1 0 13.42v2.06a9 9 0 0 0 0-17.54z"/></svg>';
+const ICON_MUTE   = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 9v6h4l5 5V4L7 9H3zm18.5 3-2.3-2.3-1.4 1.4 2.3 2.3-2.3 2.3 1.4 1.4 2.3-2.3 2.3 2.3 1.4-1.4-2.3-2.3 2.3-2.3-1.4-1.4-2.3 2.3z" transform="translate(-2 0)"/></svg>';
 
 // Keeps the transport readout + play button + lane state in sync with the engine.
 // Defined here (not inside renderComparison) because the Engine references it.
@@ -964,6 +870,7 @@ const ICON_PAUSE = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 5h4v
 // (as this used to) destroys and rebuilds the element under the pointer, which
 // can swallow a click — that was the "pause stops responding" bug.
 let _lastTransportIcon = null;
+let _lastMuteIcon = null;
 function onTransportTick() {
   const cur = fmtTime(Engine.sharedPos), dur = fmtTime(Engine.duration());
   const icon = Engine.playing ? ICON_PAUSE : ICON_PLAY;
@@ -975,6 +882,19 @@ function onTransportTick() {
     if (els.transportPlay) els.transportPlay.innerHTML = icon;
     if (els.resultsPlay) els.resultsPlay.innerHTML = icon;
     _lastTransportIcon = icon;
+  }
+
+  // mute button — only rewrite when the muted state actually changes
+  const muteIcon = Engine.muted ? ICON_MUTE : ICON_UNMUTE;
+  if (muteIcon !== _lastMuteIcon) {
+    for (const b of [els.transportMute, els.resultsMute]) {
+      if (!b) continue;
+      b.innerHTML = muteIcon;
+      b.classList.toggle("is-muted", Engine.muted);
+      b.setAttribute("aria-pressed", Engine.muted ? "true" : "false");
+      b.title = Engine.muted ? "Unmute" : "Mute";
+    }
+    _lastMuteIcon = muteIcon;
   }
 
   for (const lane of document.querySelectorAll(".lane")) {
@@ -992,6 +912,8 @@ function show(step) {
   els.stepResults.classList.toggle("hidden", step !== "results");
   // header acts as a "back to all sets" link except on the select screen
   document.querySelector("header").classList.toggle("clickable", step !== "select");
+  // paint the transport (incl. mute button) for the screen we just revealed
+  if (step !== "select") onTransportTick();
 }
 
 let folderNames = [];
@@ -1065,9 +987,9 @@ function shareLink(folder, view) {
 
 // Copy a share link to the clipboard and flash feedback on the button.
 async function copyShareLink(btn, folder, view) {
-  await navigator.clipboard.writeText(shareLink(folder, view));
+  const ok = await copyText(shareLink(folder, view));
   const old = btn.textContent;
-  btn.textContent = "✓ Copied!";
+  btn.textContent = ok ? "✓ Copied!" : "copy failed";
   setTimeout(() => { btn.textContent = old; }, 1400);
 }
 
@@ -1234,6 +1156,228 @@ function updatePrecision() {
     bar.classList.toggle("lit-better", p >= 0.66);
     bar.classList.toggle("lit-best",   p >= 1);
   }
+
+  if (DEBUG) renderDebug();
+}
+
+/* ------------------------------------------------------------------ *
+ * Debug panel (?debug=true) — live view of the rating engine internals.
+ * Reads straight from rater.core (PreferenceCore) so what you see IS what
+ * precision() is computing from. Refreshes on every vote via updatePrecision.
+ * ------------------------------------------------------------------ */
+
+// Compute the same per-pair quantities precision() uses, for display + copy.
+// Returns { rows, ranking, precision, voteCount, mismatch }.
+function debugSnapshot() {
+  const core = rater && rater.core;
+  if (!core) return null;
+  const Core = window.PreferenceCore;
+  const n = core.n;
+  const rows = [];
+  for (let i = 0; i < n; i++) {
+    for (let j = i + 1; j < n; j++) {
+      const a = { theta: core.theta[i], se: core.se[i] };
+      const b = { theta: core.theta[j], se: core.se[j] };
+      const z = Math.abs(Core.sepZ(a, b));
+      const sep = Math.max(0, Math.min(1, z / Core.SEP_Z));
+      const gate = Math.min(1, core.games[i][j] / Core.MIN_DIRECT);
+      const resolved = gate * Math.max(sep, gate * (1 - sep));
+      rows.push({
+        a: core.keys[i], b: core.keys[j],
+        games: core.games[i][j],
+        winsA: core.wins[i][j], winsB: core.wins[j][i],
+        z, sep, gate, resolved,
+        isTie: gate >= 1 && sep < 1,        // enough evidence AND still close
+      });
+    }
+  }
+  // sort worst-resolved first so problem pairs are at the top
+  rows.sort((x, y) => x.resolved - y.resolved);
+  return {
+    rows,
+    ranking: rater.ranking(),
+    precision: core.precision(),
+    voteCount: core.voteCount,
+  };
+}
+
+// Map an item key to a readable name (filename without extension).
+function debugName(key) {
+  if (!rater) return key;
+  const it = rater.itemByKey && rater.itemByKey.get(key);
+  if (!it) return key + " ⚠";          // key with no item ⇒ vote/key mismatch
+  return it.file ? it.file.replace(/\.[^.]+$/, "") : key;
+}
+
+function renderDebug() {
+  const panel = document.getElementById("debugPanel");
+  const body = document.getElementById("debugBody");
+  if (!panel || !body) return;
+  panel.classList.remove("hidden");
+  const snap = debugSnapshot();
+  if (!snap) { body.innerHTML = '<p class="muted">no active rater</p>'; return; }
+
+  const pct = (x) => (100 * x).toFixed(0) + "%";
+  const f3 = (x) => (isFinite(x) ? x.toFixed(3) : "∞");
+
+  // ranking table
+  let html = `<table><caption>ranking · precision ${pct(snap.precision)} · ${snap.voteCount} votes</caption>`;
+  html += "<tr><th>#</th><th>track</th><th>rating</th><th>±</th><th>SE(θ)</th></tr>";
+  snap.ranking.forEach((r, i) => {
+    html += `<tr><td>${i + 1}</td><td>${escapeHtml(debugName(r.key))}</td>` +
+            `<td>${Math.round(r.r)}</td><td>±${Math.round(r.rd)}</td><td>${f3(r.se)}</td></tr>`;
+  });
+  html += "</table>";
+
+  // per-pair table (worst-resolved first)
+  html += `<table><caption>pairs (worst-resolved first) — “resolved” is each pair’s contribution to the bar</caption>`;
+  html += "<tr><th>pair</th><th>games</th><th>W–L</th><th>z</th><th>sep</th><th>gate</th><th>resolved</th></tr>";
+  for (const r of snap.rows) {
+    const cls = [];
+    if (r.isTie) cls.push("is-tie");
+    if (r.gate < 1) cls.push("low-gate");
+    html += `<tr class="${cls.join(" ")}">` +
+            `<td>${escapeHtml(debugName(r.a))} vs ${escapeHtml(debugName(r.b))}</td>` +
+            `<td>${r.games}</td><td>${r.winsA}–${r.winsB}</td>` +
+            `<td>${f3(r.z)}</td><td>${f3(r.sep)}</td><td>${r.gate.toFixed(2)}</td>` +
+            `<td>${f3(r.resolved)}</td></tr>`;
+  }
+  html += "</table>";
+  body.innerHTML = html;
+}
+
+// Build a plain-text diagnostic (the whole vote history replayed + per-pair
+// breakdown around the biggest drop) and copy it to the clipboard.
+async function copyDebugDiagnostic() {
+  const out = [];
+  const log = (...a) => out.push(a.join(" "));
+  const Core = window.PreferenceCore;
+  const folder = currentFolder;
+  const state = folder ? Store.load(folder) : null;
+  const voteLog = (state && state.votes) || [];
+
+  log("=== AUDIOCOMPARE DIAGNOSTIC ===");
+  log("set:", folder || "(none)");
+  log("files:", JSON.stringify(state && state.files));
+  log("done:", !!(state && state.done), "| total votes:", voteLog.length);
+
+  if (!Core) { log("PreferenceCore missing"); }
+  if (rater && rater.core) {
+    // live key/item integrity check — the most likely bug source
+    const missing = [];
+    for (const v of voteLog) for (const key of [v.a, v.b, v.winner])
+      if (!rater.itemByKey.has(key) && !missing.includes(key)) missing.push(key);
+    log("vote keys with NO matching item (silently dropped votes):", missing.length ? JSON.stringify(missing) : "none");
+  }
+
+  // replay from scratch to get per-vote precision + rejections.
+  // IMPORTANT: the vote log stores keys as "folder::filename" (see makeItem), NOT
+  // raw filenames. Build the replay core from the actual keys in the log so the
+  // replay matches the live engine; using state.files (bare names) would reject
+  // every vote. Fall back to folder::file if the log is somehow empty.
+  if (Core && state && state.files) {
+    const logKeys = Array.from(new Set(voteLog.flatMap(v => [v.a, v.b])));
+    const replayKeys = logKeys.length
+      ? logKeys
+      : state.files.map(fn => folder + "::" + fn);
+    const mkCore = () => new Core(replayKeys.slice());
+    const core = mkCore();
+    const series = [];
+    let rejected = 0;
+    for (let i = 0; i < voteLog.length; i++) {
+      const v = voteLog[i];
+      const before = core.precision();
+      const accepted = core.vote(v.a, v.b, v.winner);
+      if (!accepted) rejected++;
+      series.push({ i, v, before, after: core.precision(), accepted });
+    }
+    log("votes rejected on replay (bad keys):", rejected);
+    log("final precision:", core.precision().toFixed(4));
+    log("final ranking:", core.ranking().map(r => debugName(r.key) + ":" + Math.round(r.r)).join("  "));
+
+    log("\n=== PER-VOTE PRECISION ===");
+    for (const e of series) {
+      const loser = e.v.winner === e.v.a ? e.v.b : e.v.a;
+      const d = e.after - e.before;
+      log(`${String(e.i).padStart(3)} | ${debugName(e.v.winner)} > ${debugName(loser)} | ` +
+          `${e.before.toFixed(3)} -> ${e.after.toFixed(3)} | ${d >= 0 ? "+" : ""}${d.toFixed(3)}` +
+          (e.accepted ? "" : "  <<< REJECTED"));
+    }
+
+    // worst drop + per-pair breakdown before/after
+    const drops = series.map(e => ({ ...e, d: e.after - e.before }))
+                        .filter(e => e.d < -0.02).sort((a, b) => a.d - b.d);
+    log("\n=== BIGGEST DROPS (delta < -0.02) ===");
+    if (!drops.length) log("(none)");
+    for (const e of drops) {
+      const loser = e.v.winner === e.v.a ? e.v.b : e.v.a;
+      log(`vote #${e.i}: ${debugName(e.v.winner)} > ${debugName(loser)} | ${e.before.toFixed(3)} -> ${e.after.toFixed(3)} (${e.d.toFixed(3)})`);
+    }
+    if (drops.length) {
+      const worst = drops[0];
+      const replayTo = (k) => { const cc = mkCore(); for (let i = 0; i < k; i++) cc.vote(voteLog[i].a, voteLog[i].b, voteLog[i].winner); return cc; };
+      const dump = (cc, label) => {
+        log(`--- ${label} (precision ${cc.precision().toFixed(4)}) ---`);
+        log("pair | games | W-L | z | sep | gate | resolved");
+        for (let i = 0; i < cc.n; i++) for (let j = i + 1; j < cc.n; j++) {
+          const a = { theta: cc.theta[i], se: cc.se[i] }, b = { theta: cc.theta[j], se: cc.se[j] };
+          const z = Math.abs(Core.sepZ(a, b));
+          const sep = Math.max(0, Math.min(1, z / Core.SEP_Z));
+          const gate = Math.min(1, cc.games[i][j] / Core.MIN_DIRECT);
+          const resolved = gate * Math.max(sep, gate * (1 - sep));
+          log(`${debugName(cc.keys[i])} vs ${debugName(cc.keys[j])} | ${cc.games[i][j]} | ${cc.wins[i][j]}-${cc.wins[j][i]} | ${z.toFixed(3)} | ${sep.toFixed(3)} | ${gate.toFixed(2)} | ${resolved.toFixed(3)}`);
+        }
+      };
+      log(`\n=== PER-PAIR BREAKDOWN around worst drop (vote #${worst.i}) ===`);
+      dump(replayTo(worst.i), "BEFORE");
+      dump(replayTo(worst.i + 1), "AFTER");
+    }
+  }
+
+  // win/games tally
+  const wins = {}, games = {};
+  for (const v of voteLog) {
+    games[v.a] = (games[v.a] || 0) + 1; games[v.b] = (games[v.b] || 0) + 1;
+    wins[v.winner] = (wins[v.winner] || 0) + 1;
+  }
+  log("\n=== WIN / GAMES PER ITEM ===");
+  for (const key of Object.keys(games)) log(`${debugName(key)} | ${wins[key] || 0} wins / ${games[key]} games`);
+
+  const report = out.join("\n");
+  const btn = document.getElementById("debugCopy");
+  const flash = (msg) => { if (btn) { const t = btn.dataset.label || btn.textContent; btn.dataset.label = t; btn.textContent = msg; setTimeout(() => btn.textContent = t, 1500); } };
+  if (await copyText(report)) flash("✓ Copied!");
+  else { console.log(report); flash("see console"); }
+}
+
+// Copy text to the clipboard, robust across insecure (HTTP) origins. The modern
+// navigator.clipboard API only works in a secure context (HTTPS/localhost); this
+// site is often served plain-HTTP off a network share, so we fall back to the
+// legacy execCommand('copy') via a hidden textarea, which works on HTTP.
+async function copyText(text) {
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch (e) { /* fall through to legacy path */ }
+  try {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.setAttribute("readonly", "");
+    ta.style.position = "fixed";
+    ta.style.top = "-1000px";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.focus();
+    ta.select();
+    ta.setSelectionRange(0, text.length);
+    const ok = document.execCommand("copy");
+    document.body.removeChild(ta);
+    return ok;
+  } catch (e) {
+    return false;
+  }
 }
 
 // Render one A-vs-B comparison. Names stay secret — lanes show only "A" / "B".
@@ -1358,6 +1502,8 @@ function escapeHtml(s) {
 /* buttons */
 els.transportPlay.addEventListener("click", () => Engine.togglePlay());
 els.resultsPlay.addEventListener("click", () => Engine.togglePlay());
+if (els.transportMute) els.transportMute.addEventListener("click", () => Engine.toggleMute());
+if (els.resultsMute) els.resultsMute.addEventListener("click", () => Engine.toggleMute());
 
 function goToSelect() {
   Engine.reset();
@@ -1398,6 +1544,8 @@ document.getElementById("resultsRestart").addEventListener("click", goToSelect);
 document.getElementById("shareTest").addEventListener("click", (e) => {
   if (currentFolder) copyShareLink(e.currentTarget, currentFolder, "compare");
 });
+// debug-only: copy a full engine diagnostic to the clipboard
+document.getElementById("debugCopy").addEventListener("click", copyDebugDiagnostic);
 document.getElementById("shareTestFromResults").addEventListener("click", (e) => {
   if (currentFolder) copyShareLink(e.currentTarget, currentFolder, "compare");
 });
@@ -1411,7 +1559,7 @@ document.querySelector("header").addEventListener("click", () => {
 });
 
 // keyboard (compare & results screens):
-//   space = play/pause · ←/→ = jump back/ahead 2s · ↑/↓ = switch track
+//   space = play/pause · ←/→ = jump back/ahead 2s · ↑/↓ = switch track · m = mute
 const NUDGE_SECONDS = 2;
 document.addEventListener("keydown", (e) => {
   const onCompare = !els.stepCompare.classList.contains("hidden");
@@ -1430,6 +1578,9 @@ document.addEventListener("keydown", (e) => {
     e.preventDefault();
     const i = Math.max(0, order.indexOf(Engine.activeKey));
     Engine.setActive(order[(i + 1) % order.length]);
+  } else if (e.key === "m" || e.key === "M") {
+    e.preventDefault();
+    Engine.toggleMute();
   }
 });
 
