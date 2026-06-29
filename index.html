@@ -401,9 +401,18 @@
 
 <!-- Pure head-to-head ranking core (see DESIGN.md). Shared, unit-tested;
      run `node compare/preference-rating.js` to exercise its test suite.
-     ?v= is a cache-buster — bump it whenever the core changes so browsers
-     don't run a stale copy (that caused "this.core.status is not a function"). -->
-<script src="preference-rating.js?v=3"></script>
+
+     PERMANENT cache-buster: we inject the <script> with a unique ?t=<timestamp>
+     every load, so the browser can NEVER serve a stale copy (a cached old core
+     caused "this.core.status is not a function"). document.write is used on
+     purpose here — it runs at parse time and inserts a BLOCKING, synchronous
+     script, so the inline app script below still runs only after the core has
+     loaded, exactly as a static <script src> tag would. No manual version bumps. -->
+<script>
+  document.write(
+    '<script src="preference-rating.js?t=' + Date.now() + '"><\/script>'
+  );
+</script>
 <script>
 "use strict";
 
