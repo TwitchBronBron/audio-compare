@@ -278,6 +278,11 @@
     /* pick buttons stack full-width and stay thumb-friendly */
     .pick-row { grid-template-columns: 1fr; }
     .pick-btn { padding: 18px; }
+
+    /* compact status text on small screens */
+    .compare-count { font-size: 12px; }
+    .compare-help { font-size: 13px; }
+    #compareTitle { font-size: 15px; }
   }
 
   /* results lanes reuse the A/B lane layout; rank pill on top, name below */
@@ -316,9 +321,9 @@
   <!-- STEP 2: compare -->
   <section id="step-compare" class="hidden">
     <div class="card">
-      <div style="display:flex;justify-content:space-between;align-items:baseline;">
+      <div style="display:flex;justify-content:space-between;align-items:baseline;gap:8px;flex-wrap:wrap;">
         <strong id="compareTitle"></strong>
-        <span class="muted" id="compareCount"></span>
+        <span class="muted compare-count" id="compareCount"></span>
       </div>
       <div class="progress-bar precision">
         <div class="progress-fill" id="progressFill"></div>
@@ -326,7 +331,7 @@
         <span class="mark m-better" title="better"></span>
         <span class="mark m-best"  title="best"></span>
       </div>
-      <p class="muted" style="margin-top:0">Press play, then click between A and B to A/B them at the same spot. Click anywhere on a waveform to jump there. When you've decided, pick the one you prefer. The bar fills as your ranking becomes statistically settled — vote as many times as you like, then hit <strong>Show results</strong>.</p>
+      <p class="muted compare-help" style="margin-top:0">Play, then tap between A and B to compare. Pick the one you prefer. The bar fills as your ranking settles — stop anytime, or keep going to raise confidence.</p>
 
       <div class="vs-wrap" id="vsWrap"></div>
 
@@ -398,7 +403,7 @@
      run `node compare/preference-rating.js` to exercise its test suite.
      ?v= is a cache-buster — bump it whenever the core changes so browsers
      don't run a stale copy (that caused "this.core.status is not a function"). -->
-<script src="preference-rating.js?v=2"></script>
+<script src="preference-rating.js?v=3"></script>
 <script>
 "use strict";
 
@@ -1071,6 +1076,7 @@ async function startSet(folder, opts) {
       state.scores[row.item.file] = {
         r: row.r, score: row.score, rank: row.rank, tied: row.tied,
         wins: row.wins, losses: row.losses,
+        votesWon: row.votesWon, votesTotal: row.votesTotal,
       };
     }
     Store.save(folder, state);
@@ -1145,30 +1151,25 @@ const TIER_LABEL = {
   "rock-solid":  "Rock solid",
 };
 
-// Build the line under the bar from the engine's phase/status. Always names the
-// phase and the SMALL, reachable next milestone (never the far finish line) —
-// "~N votes to find your winner" keeps people from leaving.
+// Build the line under the bar from the engine's phase/status. Kept SHORT for
+// mobile: a "+N" votes-remaining chip to the next milestone, the winner name
+// once locked, and a brief tier word. No filler.
+//   not complete:   "9 votes · +7 to finish"
+//   phase 1:        "12 votes · +3 to a winner"
+//   phase 2:        "🏆 Mira Bridge · +4 to settle rest"
+//   phase 3:        "🏆 Mira Bridge · Rock solid"
 function statusLine(s, voteCount) {
-  const votes = voteCount + " vote" + (voteCount === 1 ? "" : "s");
-  const tier = TIER_LABEL[s.tier] || s.tier;
+  const votes = voteCount + (voteCount === 1 ? " vote" : " votes");
   const n = s.votesToNext;
-  const more = n > 0 ? ` — ~${n} more to ${s.nextLabel}` : "";
-  if (!s.complete) {
-    // still completing the first pass: every pair seen at least once
-    return `${votes} · building your ranking${more}`;
-  }
-  if (s.phase === 1) {
-    return `${votes} · no clear winner yet${more}`;
-  }
-  // winner (or co-winners) locked
+  if (!s.complete)   return `${votes}${n ? ` · +${n} to finish` : ""}`;
+  if (s.phase === 1) return `${votes}${n ? ` · +${n} to a winner` : ""}`;
+
   const who = s.winners.length > 1
-    ? `🏆 Tied for the win: ${s.winners.map(displayWinner).join(" & ")}`
-    : `🏆 Winner: ${displayWinner(s.winners[0])}`;
-  if (s.phase === 2) {
-    return `${who} · ${tier} — you can stop now${more}`;
-  }
-  // phase 3: fully settled, only confidence left to gain
-  return `${who} · ${tier} · ranking settled — keep voting only to raise confidence`;
+    ? `🏆 ${s.winners.map(displayWinner).join(" & ")}`
+    : `🏆 ${displayWinner(s.winners[0])}`;
+  const tier = TIER_LABEL[s.tier] || s.tier;
+  if (s.phase === 2) return `${who} · +${n} to settle rest`;
+  return `${who} · ${tier}`;     // phase 3: settled; keep going only for confidence
 }
 
 // Map an item key to a readable winner name for the status line.
@@ -1495,9 +1496,13 @@ function showResults(items, opts) {
     const rankCls = isRanked ? (rank === 1 ? "top1" : rank === 2 ? "top2" : rank === 3 ? "top3" : "") : "";
     const realName = item.file.replace(/\.[^.]+$/, ""); // real filename, sans extension
 
-    // score readout: net matchups won (decided record) under the rank pill.
-    const scoreHTML = (isRanked && sc)
-      ? `<span class="score" title="net matchups won">${sc.wins}–${sc.losses}</span>`
+    // score readout under the rank pill: the intuitive overall record —
+    // "won 5 of 7 times you compared it". Falls back gracefully if an older
+    // snapshot lacks the vote totals.
+    const won = sc && sc.votesWon != null ? sc.votesWon : (sc ? sc.wins : 0);
+    const tot = sc && sc.votesTotal != null ? sc.votesTotal : null;
+    const scoreHTML = (isRanked && sc && tot)
+      ? `<span class="score" title="times you preferred this track">${won}/${tot}</span>`
       : "";
     // tie note when this track shares its cluster rank with a neighbor.
     const tieNote = (isRanked && sc && sc.tied)

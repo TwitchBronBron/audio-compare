@@ -179,9 +179,15 @@
       const rows = this.keys.map((key, i) => ({
         key,
         score: score[i],
+        // decided record: matchups CONFIRMED won/lost (crossed the floor)
         wins: decidedWins[i],
         losses: decidedLoss[i],
         played: played[i],
+        // overall record across ALL votes — the intuitive "you picked it 5 of 7
+        // times" readout the results screen shows (decided-only reads as 0–0
+        // early on, which looks like no record at all).
+        votesWon: totalWinsPer[i],
+        votesTotal: totalVotesPer[i],
         // overall win rate across all meetings — a cosmetic readout only
         winRate: totalVotesPer[i] ? totalWinsPer[i] / totalVotesPer[i] : 0,
         // display rating (cosmetic): 1500 centered, scaled by net matchup score
@@ -316,16 +322,20 @@
       else if (!allSettled) phase = 2;
       else phase = 3;
 
-      // bar fill: phase 1 = 0..0.5 by coverage toward winner-lock;
-      //           phase 2 = 0.5..0.85 by fraction of pairs settled;
-      //           phase 3 = 0.85..1.0 by competence.
+      // bar fill maps to the three markers at 1/3, 2/3, 1 (which light up as
+      // good=winner-locked, better=stop-ok, best=rock-solid). Each phase fills
+      // its own third and STAYS within it, so the fill never crosses a marker
+      // the phase hasn't reached:
+      //   phase 1 = 0 .. 1/3  by coverage toward the winner lock
+      //   phase 2 = 1/3 .. 2/3 by fraction of pairs settled
+      //   phase 3 = 2/3 .. 1   by competence
       let fill;
       const coverage = total ? (total - unseen) / total : 1;
       const settledFrac = total ? settled / total : 1;
-      if (phase === 1)      fill = 0.5 * coverage * 0.9; // cap below .5 until locked
-      else if (phase === 2) fill = 0.5 + 0.35 * settledFrac;
-      else                  fill = 0.85 + 0.15 * competence;
-      if (winnerLocked && fill < 0.5) fill = 0.5;
+      const T1 = 1 / 3, T2 = 2 / 3;
+      if (phase === 1)      fill = T1 * 0.92 * coverage;   // capped just below the first marker
+      else if (phase === 2) fill = T1 + (T2 - T1) * settledFrac;
+      else                  fill = T2 + (1 - T2) * competence;
 
       // ---- tier ----------------------------------------------------------
       let tier;
