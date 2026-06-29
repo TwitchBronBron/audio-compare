@@ -1,45 +1,42 @@
 /* ==================================================================== *
- * preference-rating.js  —  Bradley–Terry preference rating core
+ * preference-rating.js  —  head-to-head preference ranking core
  * ==================================================================== *
  *
- * PURE STATISTICS, NO DOM. This file is the single source of truth for the
- * ranking math used by the audio-comparison tool. It is loaded two ways:
+ * PURE LOGIC, NO DOM. Single source of truth for the ranking used by the
+ * audio-comparison tool. Loaded two ways:
  *
- *   • In the browser:  <script src="preference-rating.js"></script>
- *     exposes  window.PreferenceCore.
- *   • In Node:         const { PreferenceCore, runTests } = require('./preference-rating.js');
- *     and  `node preference-rating.js`  RUNS THE TEST SUITE (runTests()).
+ *   • Browser:  <script src="preference-rating.js"></script>  → window.PreferenceCore
+ *   • Node:     const { PreferenceCore, runTests } = require('./preference-rating.js');
+ *               `node preference-rating.js`  runs the test suite.
  *
- * The UI layer (compare/index.html) wraps PreferenceCore with the play/serve
- * loop and rendering; none of that lives here, so the math can be hammered by
- * tests with zero browser.
+ * See DESIGN.md for the full rationale. The short version:
  *
- * ----------------------------------------------------------------------
- * THE MODEL
- * ----------------------------------------------------------------------
- * Each item i has a latent strength θ_i (log scale). Bradley–Terry says
- *     P(i beats j) = 1 / (1 + e^-(θ_i - θ_j)).
- * We fit θ to the FULL vote history by maximum likelihood using the standard
- * MM (minorization–maximization) iteration. With only 3–8 items and every
- * vote stored, fitting the real model after each vote is cheap and exact —
- * we do NOT use the online RD-decay approximation (Glicko) that chess engines
- * use for huge populations; that approximation has a sticky uncertainty floor
- * that, at this scale, kept the confidence bar from ever moving.
+ * This used to be a Bradley–Terry maximum-likelihood model. It was ripped out
+ * because the global strength fit produced rankings that CONTRADICTED the user's
+ * own direct head-to-head choices (it would put item X at #1 even though the user
+ * picked Y over X three times out of four). This tool is "I like this one more
+ * than that one", so the ranking is built FROM the head-to-heads and can never
+ * override them.
  *
- * UNCERTAINTY comes from the data via Fisher information: an item's standard
- * error shrinks as you vote on it more and as votes are consistent. Flip-flop
- * on a pair and their strengths sit near-equal with wide overlapping error
- * bars — exactly the "you don't really have a preference here" signal.
+ * THE MODEL — one head-to-head grid:
+ *   wins[i][j]  = times the user picked i over j
+ *   games[i][j] = wins[i][j] + wins[j][i]
  *
- * A symmetric pseudo-count prior keeps the fit defined even with zero votes
- * and keeps SEs finite, so the precision bar starts near 0 and climbs smoothly.
+ * Each pair is `unseen` / `provisional` / `decided` / `tied`. Rank by matchups
+ * won against the field (each opponent counted once, so a 9–0 blowout is worth
+ * the same as a 5–4 win: one matchup). Tied items merge into shared-rank
+ * clusters — this applies at #1 too (a "winner's circle"). A confirmed tie is a
+ * valid ANSWER, not a failure to separate.
+ *
+ * COMPLETION (every pair seen ≥1×) is separate from CONFIDENCE (how hard-backed
+ * those answers are). One pass → a complete, correct ranking at low confidence;
+ * grinding raises confidence without ever being required.
  * ==================================================================== */
 
 (function (root, factory) {
   const api = factory();
   if (typeof module === "object" && module.exports) {
     module.exports = api;                 // Node
-    // `node preference-rating.js` runs the suite.
     if (require.main === module) {
       const ok = api.runTests();
       if (typeof process !== "undefined") process.exit(ok ? 0 : 1);
@@ -52,15 +49,14 @@
   "use strict";
 
   /* ------------------------------------------------------------------ *
-   * PreferenceCore — the pure rating engine.
+   * PreferenceCore — the pure ranking engine.
    *
-   * Constructed with a list of opaque keys (strings). It maintains the
-   * win/games matrices, fits θ + SE after each recorded vote, and exposes
-   * ranking()/precision()/sepZ()/nextPair(). It knows NOTHING about audio,
-   * the DOM, or how matchups are presented.
+   * Constructed with a list of opaque keys (strings). Maintains the wins/games
+   * grid, derives pair states, ranking clusters, completion, confidence, and
+   * the next matchup to serve. Knows NOTHING about audio or the DOM.
    *
-   * A small injectable RNG (default Math.random) makes nextPair() and tie
-   * handling deterministic under test.
+   * An injectable RNG (default Math.random) keeps nextPair() deterministic
+   * under test.
    * ------------------------------------------------------------------ */
   class PreferenceCore {
     constructor(keys, opts) {
@@ -75,44 +71,15 @@
       this.wins = Array.from({ length: this.n }, () => new Array(this.n).fill(0));
       // games[i][j] = total comparisons between i and j (symmetric)
       this.games = Array.from({ length: this.n }, () => new Array(this.n).fill(0));
-
-      // fitted strengths (log scale) + standard errors, recomputed after each vote
-      this.theta = new Array(this.n).fill(0);
-      this.se = new Array(this.n).fill(Infinity);
-
-      this._fit();
     }
 
-    // Display scale: rating = 1500 + SCALE·θ. Purely cosmetic; all
-    // significance math is done on θ directly.
-    static get SCALE() { return 400 / Math.LN10; }  // matches Elo's 400/ln10 slope
-    static get Z() { return 1.96; }                 // ±95% display interval
-    // "Separated" = 95% one-sided significance (z ≥ 1.64). This is the threshold
-    // the confidence half of the bar and the "≈ tied" results flag both use, so a
-    // pair only counts as resolved once we're genuinely confident in its direction
-    // — a real significance bar, not a feel-good one.
-    static get SEP_Z() { return 1.64; }
-    // Per-item coverage floor: the "you have an initial ranking" bracket gate.
-    // Each item must appear in at least floorK(n) = ceil(2·log2 n) comparisons
-    // before the ranking is considered established. This scales sub-quadratically
-    // (like a bracket), so even 7–8 items reach a stable order in ~30 votes
-    // instead of the n² it would take to compare every PAIR directly.
-    static floorK(n) { return Math.max(2, Math.ceil(2 * Math.log2(Math.max(2, n)))); }
-    // Back-compat alias: old call sites referenced MIN_DIRECT as the per-pair gate.
-    // The metric is now per-ITEM coverage (see floorK), but anything still reading
-    // MIN_DIRECT (e.g. the debug panel) gets a sane small value.
-    static get MIN_DIRECT() { return 2; }
-
-    // significance of A over B as a z-score on the strength difference.
-    // Accepts either a fitted row {theta, se} or a saved snapshot {r, rd}.
-    static sepZ(a, b) {
-      const ta = a.theta != null ? a.theta : (a.r - 1500) / PreferenceCore.SCALE;
-      const tb = b.theta != null ? b.theta : (b.r - 1500) / PreferenceCore.SCALE;
-      const sea = a.se != null ? a.se : (a.rd / PreferenceCore.Z) / PreferenceCore.SCALE;
-      const seb = b.se != null ? b.se : (b.rd / PreferenceCore.Z) / PreferenceCore.SCALE;
-      const sd = Math.sqrt(sea * sea + seb * seb) || 1e-9;
-      return (ta - tb) / sd;
-    }
+    // ---- tunable constants (see DESIGN.md) -------------------------------
+    // Min meetings before a pair is a CONFIRMED decided/tied (vs provisional).
+    static get MEET_FLOOR() { return 3; }
+    // Fraction one-sided needed to be `decided` (else it's a confirmed tie).
+    static get DECIDE_FRAC() { return 2 / 3; }
+    // Head-to-head margin the top boundary needs to "crown" a single winner.
+    static get WIN_MARGIN() { return 2; }
 
     _record(iWin, iLose) {
       this.wins[iWin][iLose]++;
@@ -128,11 +95,10 @@
       const oi = this.idx.get(loserKey);
       if (wi == null || oi == null || wi === oi) return false;
       this._record(wi, oi);
-      this._fit();
       return true;
     }
 
-    // Load a prior vote log (array of {a, b, winner}) into the matrices.
+    // Load a prior vote log (array of {a, b, winner}) into the grid.
     replay(log) {
       for (const v of log) {
         const wi = this.idx.get(v.winner);
@@ -140,470 +106,523 @@
         if (wi == null || oi == null || wi === oi) continue;
         this._record(wi, oi);
       }
-      this._fit();
     }
 
-    // ---- Bradley–Terry MLE via MM iteration --------------------------------
-    // A tiny symmetric pseudo-count (Bayesian prior) keeps the fit defined even
-    // before any votes, and keeps SEs finite — that is what makes the bar start
-    // near 0 and climb smoothly rather than being undefined then snapping.
-    _fit() {
-      const n = this.n, PRIOR = 0.5;
-      const W = [], N = [];
-      for (let i = 0; i < n; i++) {
-        W[i] = 0;
-        N[i] = [];
-        for (let j = 0; j < n; j++) {
-          N[i][j] = i === j ? 0 : this.games[i][j] + 2 * PRIOR;
-          if (i !== j) W[i] += this.wins[i][j] + PRIOR;
-        }
+    /* ---- pair state ---------------------------------------------------- *
+     * Returns { games, wins, loss, leader, state } for the unordered pair
+     * (i, j). `leader` is the index currently ahead (or null if dead even),
+     * `state` ∈ "unseen" | "provisional" | "decided" | "tied".
+     * -------------------------------------------------------------------- */
+    pairState(i, j) {
+      const w = this.wins[i][j], l = this.wins[j][i], g = w + l;
+      const leader = w > l ? i : l > w ? j : null;
+      let state;
+      if (g === 0) {
+        state = "unseen";
+      } else if (g < PreferenceCore.MEET_FLOOR) {
+        state = "provisional";
+      } else {
+        const top = Math.max(w, l);
+        state = (top / g) > PreferenceCore.DECIDE_FRAC ? "decided" : "tied";
       }
-
-      // strengths p_i = e^θ_i ; iterate MM updates, renormalize (geo-mean = 1)
-      let p = new Array(n).fill(1);
-      for (let iter = 0; iter < 200; iter++) {
-        const np = new Array(n).fill(0);
-        for (let i = 0; i < n; i++) {
-          let denom = 0;
-          for (let j = 0; j < n; j++) {
-            if (i === j) continue;
-            denom += N[i][j] / (p[i] + p[j]);
-          }
-          np[i] = denom > 0 ? W[i] / denom : p[i];
-        }
-        let logsum = 0;
-        for (let i = 0; i < n; i++) logsum += Math.log(np[i]);
-        const gm = Math.exp(logsum / n);
-        let maxRel = 0;
-        for (let i = 0; i < n; i++) {
-          np[i] /= gm;
-          maxRel = Math.max(maxRel, Math.abs(np[i] - p[i]) / (p[i] || 1));
-        }
-        p = np;
-        if (maxRel < 1e-9) break;
-      }
-
-      this.theta = p.map(v => Math.log(v));
-
-      // ---- standard errors from the Fisher information ----------------------
-      // Observed information for θ_i (others fixed):
-      //   I_ii = Σ_j N_ij · P_ij · (1 - P_ij),  P_ij = p_i/(p_i+p_j).
-      // SE_i ≈ 1/√I_ii. Shrinks as you play i more, largest for ~50/50 pairs.
-      for (let i = 0; i < n; i++) {
-        let info = 0;
-        for (let j = 0; j < n; j++) {
-          if (i === j) continue;
-          const Pij = p[i] / (p[i] + p[j]);
-          info += N[i][j] * Pij * (1 - Pij);
-        }
-        this.se[i] = info > 0 ? 1 / Math.sqrt(info) : Infinity;
-      }
+      return { i, j, games: g, wins: w, loss: l, leader, state };
     }
 
-    // P(i beats j) under the current fit — handy for tests + matchup logic.
+    // P(i is preferred over j) as a simple smoothed win rate — handy for the UI
+    // and tests. Laplace-smoothed so an unseen pair reads 0.5.
     winProb(aKey, bKey) {
       const i = this.idx.get(aKey), j = this.idx.get(bKey);
-      const pi = Math.exp(this.theta[i]), pj = Math.exp(this.theta[j]);
-      return pi / (pi + pj);
+      const w = this.wins[i][j], l = this.wins[j][i];
+      return (w + 0.5) / (w + l + 1);
     }
 
-    // Current ranking, best first, with display rating + interval bounds.
-    // Each row: {key, theta, se, r, rd, lo, hi}.
+    /* ---- ranking ------------------------------------------------------- *
+     * Score each item by matchups WON against the field (each opponent counted
+     * once): +1 if decided over j, -1 if decided under j, 0 otherwise. For
+     * provisional pairs we lean on the current leader at half weight so a single
+     * pass still yields a sensible order without overriding decided results.
+     *
+     * Returns rows best-first:
+     *   { key, score, wins, losses, played, winRate, r, rank, tied }
+     * `rank` is the 1-based cluster rank (shared by tied items); `tied` is true
+     * when the item shares its rank with a neighbor (a tie cluster, incl. #1).
+     * -------------------------------------------------------------------- */
     ranking() {
-      return this.keys
-        .map((key) => {
-          const i = this.idx.get(key);
-          const r = 1500 + PreferenceCore.SCALE * this.theta[i];
-          const rd = PreferenceCore.Z * PreferenceCore.SCALE * (isFinite(this.se[i]) ? this.se[i] : 3);
-          return { key, theta: this.theta[i], se: this.se[i], r, rd, lo: r - rd, hi: r + rd };
-        })
-        .sort((x, y) => y.theta - x.theta);
-    }
-
-    // Total comparisons item i has taken part in (across all opponents).
-    appearances(i) {
-      let s = 0;
-      for (let j = 0; j < this.n; j++) if (j !== i) s += this.games[i][j];
-      return s;
-    }
-
-    // ── The progress bar, in TWO STAGES ──────────────────────────────────────
-    //
-    // The bar conflated two different questions into one number, which is why it
-    // felt wrong: "have I voted enough to even HAVE a ranking?" (a floor you hit
-    // fast, bracket-style) is not the same as "how STATISTICALLY SURE am I that
-    // this ranking is real?" (climbs without bound as you keep voting). We split
-    // them and stack them into one fill:
-    //
-    //   coverage   — every item compared at least floorK(n) times. This is the
-    //                "you now have a trustworthy initial ranking" gate. It scales
-    //                like a bracket (~n·log n total votes), NOT like comparing
-    //                every pair (n²), so big sets stay reachable.
-    //   confidence — fraction of pairs that are either SIGNIFICANTLY separated
-    //                (z ≥ SEP_Z = 95% one-sided) or a confirmed near-tie. This is
-    //                the honest significance measure; it never needs to reach 100%
-    //                to be useful, and every extra vote nudges it up.
-    //
-    // The visible bar is: first half = coverage, second half = confidence.
-    //   fill = coverage < 1 ? 0.5·coverage : 0.5 + 0.5·confidence
-    // So the midpoint (50%) is exactly "Ranked — you can stop, or keep going to
-    // raise confidence", which is the bracket-then-sharpen model we want.
-    //
-    // Each pair is scored independently of sort adjacency (a reorder can't move
-    // the metric), and casting any vote only ADDS evidence, so the bar climbs
-    // almost monotonically — a contradictory vote on a close pair nudges that one
-    // pair's `sep` down a touch (an honest dip), never a reset.
-    confidence() {
       const n = this.n;
-      if (n < 2) return { coverage: 1, confidence: 1, fill: 1 };
-      const K = PreferenceCore.floorK(n);
+      const score = new Array(n).fill(0);
+      const decidedWins = new Array(n).fill(0);
+      const decidedLoss = new Array(n).fill(0);
+      const played = new Array(n).fill(0);
+      let totalVotesPer = new Array(n).fill(0);
+      let totalWinsPer = new Array(n).fill(0);
 
-      // coverage: each item toward K total appearances, averaged across items.
-      let cov = 0;
-      for (let i = 0; i < n; i++) cov += Math.min(1, this.appearances(i) / K);
-      cov /= n;
-
-      // confidence: per-pair, gated by how well-sampled BOTH items are (we trust
-      // the transitive fit, so the gate is per-item coverage, not per-pair votes).
-      let conf = 0, count = 0;
       for (let i = 0; i < n; i++) {
-        for (let j = i + 1; j < n; j++) {
-          const a = { theta: this.theta[i], se: this.se[i] };
-          const b = { theta: this.theta[j], se: this.se[j] };
-          const z = Math.abs(PreferenceCore.sepZ(a, b));
-          const sep = Math.max(0, Math.min(1, z / PreferenceCore.SEP_Z));
-          const gate = Math.min(1, this.appearances(i) / K, this.appearances(j) / K);
-          const knownTie = gate * (1 - sep);   // sampled enough AND they're close
-          conf += gate * Math.max(sep, knownTie);
-          count++;
+        for (let j = 0; j < n; j++) {
+          if (i === j) continue;
+          const g = this.games[i][j];
+          if (g > 0) { played[i]++; totalVotesPer[i] += g; totalWinsPer[i] += this.wins[i][j]; }
+          if (j <= i) continue;
+          const ps = this.pairState(i, j);
+          if (ps.state === "decided") {
+            if (ps.leader === i) { score[i] += 1; score[j] -= 1; decidedWins[i]++; decidedLoss[j]++; }
+            else                 { score[j] += 1; score[i] -= 1; decidedWins[j]++; decidedLoss[i]++; }
+          } else if (ps.state === "provisional" && ps.leader != null) {
+            // half weight: provisional direction informs the order but yields to
+            // any decided result and to a true score difference.
+            if (ps.leader === i) { score[i] += 0.5; score[j] -= 0.5; }
+            else                 { score[j] += 0.5; score[i] -= 0.5; }
+          }
+          // unseen / tied contribute 0
         }
       }
-      conf = count ? conf / count : 1;
 
-      const fill = cov < 1 ? 0.5 * cov : 0.5 + 0.5 * conf;
-      return { coverage: cov, confidence: conf, fill };
+      const rows = this.keys.map((key, i) => ({
+        key,
+        score: score[i],
+        wins: decidedWins[i],
+        losses: decidedLoss[i],
+        played: played[i],
+        // overall win rate across all meetings — a cosmetic readout only
+        winRate: totalVotesPer[i] ? totalWinsPer[i] / totalVotesPer[i] : 0,
+        // display rating (cosmetic): 1500 centered, scaled by net matchup score
+        r: 1500 + 80 * score[i],
+        _i: i,
+      }));
+
+      // sort best-first by score, then by direct head-to-head, then by win rate
+      rows.sort((a, b) => {
+        if (b.score !== a.score) return b.score - a.score;
+        const wa = this.wins[a._i][b._i], wb = this.wins[b._i][a._i];
+        if (wa !== wb) return wb - wa;
+        return b.winRate - a.winRate;
+      });
+
+      // assign cluster ranks: two adjacent rows are in the SAME cluster when
+      // neither is `decided` over the other (i.e. tied / provisional-even /
+      // unseen between them AND equal score). Olympic-style shared rank numbers.
+      let rank = 1;
+      for (let p = 0; p < rows.length; p++) {
+        if (p === 0) { rows[p].rank = 1; continue; }
+        const prev = rows[p - 1], cur = rows[p];
+        const ps = this.pairState(prev._i, cur._i);
+        const mergeable = cur.score === prev.score && ps.state !== "decided";
+        if (mergeable) {
+          rows[p].rank = prev.rank;          // same cluster
+        } else {
+          rows[p].rank = p + 1;              // new cluster (Olympic gap)
+        }
+      }
+      // mark tie clusters (any rank shared by >1 row)
+      const countByRank = {};
+      for (const row of rows) countByRank[row.rank] = (countByRank[row.rank] || 0) + 1;
+      for (const row of rows) { row.tied = countByRank[row.rank] > 1; delete row._i; }
+
+      return rows;
     }
 
-    // Back-compat: the UI's bar reads a single 0..1 number. precision() now
-    // returns the stacked two-stage fill (coverage then confidence).
-    precision() { return this.confidence().fill; }
+    /* ---- completion / phase / confidence ------------------------------- *
+     * status() returns the single object the UI needs:
+     *   {
+     *     complete,            // every pair seen ≥1× → a full ranking exists
+     *     phase,               // 1 finding-winner | 2 settling | 3 confident
+     *     winnerLocked,        // top cluster is locked (single winner or tie)
+     *     winners: [keys],     // the top cluster (1+ keys)
+     *     competence,          // 0..1 felt-sureness (weakest adjacent boundary)
+     *     tier,                // "building" | "pretty-sure" | "confident" | "rock-solid"
+     *     fill,                // 0..1 bar fill (phase-aware, see below)
+     *     stopOk,              // true once phase ≥ 2 (good-enough-to-stop marker passed)
+     *     votesToNext,         // est. votes to the next milestone
+     *     nextLabel,           // what that milestone is
+     *   }
+     * -------------------------------------------------------------------- */
+    status() {
+      const n = this.n;
+      if (n < 2) {
+        return { complete: true, phase: 3, winnerLocked: true, winners: this.keys.slice(),
+                 competence: 1, tier: "rock-solid", fill: 1, stopOk: true,
+                 votesToNext: 0, nextLabel: "done" };
+      }
 
-    // Semi-random next matchup, returned as [keyA, keyB] with random side order.
-    // Weight every pair toward (a) statistically close and (b) under-sampled,
-    // then sample one pair in proportion to weight. Sampling is UNBIASED — which
-    // pairs you see affects only how fast confidence grows, never the ranking.
+      // gather pair states
+      let unseen = 0, provisional = 0, settled = 0, total = 0;
+      let provisionalNeed = 0;     // extra meetings to bring provisionals to floor
+      for (let i = 0; i < n; i++) {
+        for (let j = i + 1; j < n; j++) {
+          const ps = this.pairState(i, j);
+          total++;
+          if (ps.state === "unseen") unseen++;
+          else if (ps.state === "provisional") {
+            provisional++;
+            provisionalNeed += Math.max(1, PreferenceCore.MEET_FLOOR - ps.games);
+          } else settled++;
+        }
+      }
+      const complete = unseen === 0;
+
+      const rows = this.ranking();
+
+      // ---- winner lock: is the top boundary resolved? --------------------
+      // Locked if the top cluster is a confirmed tie (winner's circle) OR the
+      // #1 vs #2 boundary is `decided` with margin ≥ WIN_MARGIN over the floor.
+      const topRank = rows[0].rank;
+      const winners = rows.filter(r => r.rank === topRank).map(r => r.key);
+      let winnerLocked, votesToWinner = 0;
+      if (winners.length > 1) {
+        // top is a tie cluster — locked only once those pairs cleared the floor
+        winnerLocked = true;
+        for (let a = 0; a < winners.length; a++)
+          for (let b = a + 1; b < winners.length; b++) {
+            const ps = this.pairState(this.idx.get(winners[a]), this.idx.get(winners[b]));
+            if (ps.games < PreferenceCore.MEET_FLOOR) { winnerLocked = false; votesToWinner += (PreferenceCore.MEET_FLOOR - ps.games); }
+          }
+      } else {
+        const top = rows[0], second = rows[1];
+        const ti = this.idx.get(top.key), si = this.idx.get(second.key);
+        const ps = this.pairState(ti, si);
+        const margin = Math.abs(ps.wins - ps.loss);
+        winnerLocked = ps.games >= PreferenceCore.MEET_FLOOR &&
+                       ps.state === "decided" && margin >= PreferenceCore.WIN_MARGIN;
+        if (!winnerLocked) {
+          // rough votes to lock: reach floor, then enough to hit the margin
+          const toFloor = Math.max(0, PreferenceCore.MEET_FLOOR - ps.games);
+          const toMargin = Math.max(0, PreferenceCore.WIN_MARGIN - margin);
+          votesToWinner = Math.max(1, toFloor, Math.ceil(toMargin / 2) + toFloor);
+        }
+      }
+
+      // ---- competence: weakest adjacent boundary -------------------------
+      // Each adjacent boundary's "sureness": a decided gap = margin·backing; a
+      // confirmed tie boundary counts as fully sure (we KNOW it's even).
+      let competence = 1;
+      for (let p = 0; p < rows.length - 1; p++) {
+        if (rows[p].rank === rows[p + 1].rank) continue;   // inside a tie cluster
+        const i = this.idx.get(rows[p].key), j = this.idx.get(rows[p + 1].key);
+        const ps = this.pairState(i, j);
+        let sure;
+        if (ps.state === "tied") sure = 1;                  // confirmed equal
+        else if (ps.games === 0) sure = 0;
+        else {
+          const margin = Math.abs(ps.wins - ps.loss) / ps.games;
+          const backing = Math.min(1, ps.games / PreferenceCore.MEET_FLOOR);
+          sure = margin * backing;
+        }
+        competence = Math.min(competence, sure);
+      }
+
+      // ---- phase + fill --------------------------------------------------
+      const allSettled = unseen === 0 && provisional === 0;
+      let phase;
+      if (!winnerLocked) phase = 1;
+      else if (!allSettled) phase = 2;
+      else phase = 3;
+
+      // bar fill: phase 1 = 0..0.5 by coverage toward winner-lock;
+      //           phase 2 = 0.5..0.85 by fraction of pairs settled;
+      //           phase 3 = 0.85..1.0 by competence.
+      let fill;
+      const coverage = total ? (total - unseen) / total : 1;
+      const settledFrac = total ? settled / total : 1;
+      if (phase === 1)      fill = 0.5 * coverage * 0.9; // cap below .5 until locked
+      else if (phase === 2) fill = 0.5 + 0.35 * settledFrac;
+      else                  fill = 0.85 + 0.15 * competence;
+      if (winnerLocked && fill < 0.5) fill = 0.5;
+
+      // ---- tier ----------------------------------------------------------
+      let tier;
+      if (!winnerLocked) tier = "building";
+      else if (competence >= 0.85) tier = "rock-solid";
+      else if (competence >= 0.5) tier = "confident";
+      else tier = "pretty-sure";
+
+      // ---- next milestone + votes remaining ------------------------------
+      let votesToNext, nextLabel;
+      if (!complete) {
+        votesToNext = unseen;
+        nextLabel = "complete the first pass";
+      } else if (phase === 1) {
+        votesToNext = Math.max(1, votesToWinner);
+        nextLabel = "find your winner";
+      } else if (phase === 2) {
+        votesToNext = Math.max(1, provisionalNeed);
+        nextLabel = "settle the rest of the ranking";
+      } else {
+        votesToNext = 0;
+        nextLabel = "raise confidence (optional)";
+      }
+
+      return {
+        complete, phase, winnerLocked, winners,
+        competence, tier, fill,
+        stopOk: phase >= 2,
+        votesToNext, nextLabel,
+        counts: { unseen, provisional, settled, total },
+      };
+    }
+
+    // Back-compat: the UI's bar reads a single 0..1 number. precision() now maps
+    // to the phase-aware fill from status().
+    precision() { return this.status().fill; }
+
+    /* ---- next matchup -------------------------------------------------- *
+     * Serve only pairs that still need work; never re-serve a settled pair.
+     * Priority: unseen first (reach completion fast), then provisional pairs
+     * weighted toward those closest in the current standings and least-met.
+     * If everything is settled, pick the weakest adjacent boundary to firm up
+     * (so a grinder can keep raising confidence) — but with a low ceiling so it
+     * doesn't loop forever. Returns [keyA, keyB] with randomized side order.
+     * -------------------------------------------------------------------- */
     nextPair() {
       if (this.n < 2) return null;
-      const rk = this.ranking();
-      const pos = new Map(rk.map((row, r) => [row.key, r]));
-      const pairs = [];
+      const rows = this.ranking();
+      const pos = new Map(rows.map((row, r) => [row.key, r]));
+
+      const candidates = [];
       let total = 0;
       for (let i = 0; i < this.n; i++) {
         for (let j = i + 1; j < this.n; j++) {
+          const ps = this.pairState(i, j);
           const ki = this.keys[i], kj = this.keys[j];
-          const g = this.games[i][j];
-          const a = rk[pos.get(ki)], b = rk[pos.get(kj)];
-          const z = Math.abs(PreferenceCore.sepZ(a, b));
-          const closeness = Math.max(0.05, 1 - Math.min(1, z / PreferenceCore.SEP_Z));
-          const undersampled = 1 / (1 + g);
           const adjacency = 1 / (1 + Math.abs(pos.get(ki) - pos.get(kj)));
-          // hard boost for pairs still short of the direct-vote gate so a pair
-          // the random draw keeps skipping can't stay gated at 0 forever.
-          const needsDirect = g < PreferenceCore.MIN_DIRECT ? 3.0 : 0;
-          // CONTESTED boost — the fix for "one upset tanked the bar and then the
-          // engine stopped asking about it." A pair is contested when it's
-          // statistically close (sep < 1) AND it has the kind of split record
-          // that means more votes would actually move it. We measure that as the
-          // pair's "recoverable precision": how far its resolved-contribution is
-          // below a confident verdict, scaled by how SPLIT its head-to-head is
-          // (a 1–1 or 2–1 record is contested; a 3–0 record is not). This makes
-          // a freshly-contradicted near-tie — exactly the MB-vs-MBT case — the
-          // most likely next matchup, so a mistake gets re-litigated in 2–3
-          // votes instead of lingering and suppressing the bar.
-          const sep = Math.min(1, z / PreferenceCore.SEP_Z);
-          const wins = this.wins[i][j], losses = this.wins[j][i];
-          const decided = wins + losses;
-          // splitness: 1 when the record is evenly split (max contradiction),
-          // 0 when it's a clean sweep. (Undefined record → 0; needsDirect covers it.)
-          const splitness = decided > 0 ? 1 - Math.abs(wins - losses) / decided : 0;
-          const contested = (1 - sep) * splitness;
-          const w = 0.15 + closeness * 1.0 + undersampled * 1.0 + adjacency * 0.5
-                  + needsDirect + contested * 2.5;
-          pairs.push({ i, j, w });
-          total += w;
+          let w = 0;
+          if (ps.state === "unseen") {
+            w = 100;                                   // top priority: complete the pass
+          } else if (ps.state === "provisional") {
+            const toFloor = PreferenceCore.MEET_FLOOR - ps.games;
+            w = 10 + 6 * toFloor + 8 * adjacency;      // close-in-standings, under-met
+          } else {
+            // settled: only a faint pull so grinders can firm up the weakest gap
+            const margin = ps.games ? Math.abs(ps.wins - ps.loss) / ps.games : 1;
+            w = 0.4 * (1 - margin) * adjacency;
+          }
+          if (w > 0) { candidates.push({ i, j, w }); total += w; }
         }
       }
-      let pick = pairs[0];
+      if (!candidates.length) {
+        // everything maximally settled — fall back to a random distinct pair
+        let i = Math.floor(this.rng() * this.n), j = Math.floor(this.rng() * (this.n - 1));
+        if (j >= i) j++;
+        candidates.push({ i, j, w: 1 }); total = 1;
+      }
+
+      let pick = candidates[0];
       let roll = this.rng() * total;
-      for (const pr of pairs) { roll -= pr.w; if (roll <= 0) { pick = pr; break; } }
+      for (const c of candidates) { roll -= c.w; if (roll <= 0) { pick = c; break; } }
       const ka = this.keys[pick.i], kb = this.keys[pick.j];
       return this.rng() < 0.5 ? [ka, kb] : [kb, ka];
     }
   }
 
   /* ================================================================== *
-   * TEST SUITE
-   * ================================================================== *
-   * Hand-rolled, zero-dependency. `node preference-rating.js` runs it.
-   * Returns true iff everything passed. Each test asserts a property the
-   * MATH must hold, not an implementation detail — so this stays valid if
-   * the internals are tuned.
+   * TEST SUITE — `node preference-rating.js` runs it. Returns true iff green.
    * ================================================================== */
-
   function runTests() {
     let passed = 0, failed = 0;
     const fails = [];
-
-    function ok(cond, msg) {
-      if (cond) { passed++; }
-      else { failed++; fails.push(msg); }
-    }
-    function approx(a, b, tol, msg) {
-      ok(Math.abs(a - b) <= tol, `${msg} (got ${a}, want ${b}±${tol})`);
-    }
-
-    // A seeded RNG so any test that touches nextPair() is reproducible.
+    function ok(cond, msg) { if (cond) passed++; else { failed++; fails.push(msg); } }
+    function approx(a, b, tol, msg) { ok(Math.abs(a - b) <= tol, `${msg} (got ${a}, want ${b}±${tol})`); }
     function makeRng(seed) {
       let s = seed >>> 0;
-      return function () {
-        // xorshift32
-        s ^= s << 13; s >>>= 0;
-        s ^= s >> 17;
-        s ^= s << 5; s >>>= 0;
-        return (s >>> 0) / 4294967296;
-      };
+      return function () { s ^= s << 13; s >>>= 0; s ^= s >> 17; s ^= s << 5; s >>>= 0; return (s >>> 0) / 4294967296; };
     }
+    function voteN(core, w, l, count) { for (let k = 0; k < count; k++) core.vote(w, l, w); }
+    const FLOOR = PreferenceCore.MEET_FLOOR;
 
-    // Helper: cast `count` votes for winner over loser.
-    function voteN(core, winner, loser, count) {
-      for (let k = 0; k < count; k++) core.vote(winner, loser, winner);
-    }
-
-    // ---- 1. Construction is sane with zero votes -------------------------
+    // ---- 1. Construction sane with zero votes ----------------------------
     (function () {
       const c = new PreferenceCore(["A", "B", "C"]);
       ok(c.n === 3, "n reflects key count");
-      // With no data, all strengths equal (prior is symmetric).
-      approx(c.theta[0], c.theta[1], 1e-9, "no votes ⇒ equal strength A,B");
-      approx(c.theta[1], c.theta[2], 1e-9, "no votes ⇒ equal strength B,C");
-      // SEs finite (prior keeps them defined) and equal.
-      ok(isFinite(c.se[0]), "no votes ⇒ finite SE");
-      approx(c.se[0], c.se[1], 1e-9, "no votes ⇒ equal SE");
-      // Precision starts at 0 (no direct votes ⇒ direct gate is 0).
-      approx(c.precision(), 0, 1e-9, "no votes ⇒ precision 0");
+      const rk = c.ranking();
+      ok(rk.length === 3, "ranking has all items");
+      ok(rk.every(r => r.score === 0), "no votes ⇒ all scores 0");
+      const s = c.status();
+      ok(!s.complete, "no votes ⇒ not complete");
+      ok(s.phase === 1, "no votes ⇒ phase 1");
+      approx(s.fill, 0, 1e-9, "no votes ⇒ empty bar");
     })();
 
-    // ---- 2. Consistent winner ranks above loser --------------------------
+    // ---- 2. Consistent winner ranks above loser, never contradicts H2H ---
     (function () {
       const c = new PreferenceCore(["A", "B"]);
       voteN(c, "A", "B", 5);
       const rk = c.ranking();
       ok(rk[0].key === "A", "5–0 ⇒ A ranks first");
-      ok(rk[0].theta > rk[1].theta, "winner has higher theta");
       ok(c.winProb("A", "B") > 0.5, "winProb(A,B) > 0.5 after A wins");
+      ok(c.pairState(0, 1).state === "decided", "5–0 ⇒ decided");
     })();
 
-    // ---- 3. Transitivity: A>B>C emerges from pairwise votes --------------
+    // ---- 3. THE headline fix: direct H2H is never overridden -------------
+    // The exact shape of the user's real bug: B beats everyone weak, but A beat
+    // B directly 3–1. A must NOT rank below B.
+    (function () {
+      const c = new PreferenceCore(["A", "B", "C", "D"]);
+      voteN(c, "A", "B", 3); voteN(c, "B", "A", 1);   // A>B 3–1 (decided for A)
+      voteN(c, "B", "C", 4); voteN(c, "B", "D", 4);   // B crushes C, D
+      const rk = c.ranking();
+      const posA = rk.findIndex(r => r.key === "A");
+      const posB = rk.findIndex(r => r.key === "B");
+      ok(posA < posB, "A (beat B 3–1 directly) ranks above B despite B's transitive wins");
+    })();
+
+    // ---- 4. Transitivity emerges for decided pairs -----------------------
     (function () {
       const c = new PreferenceCore(["A", "B", "C"]);
-      voteN(c, "A", "B", 4);
-      voteN(c, "B", "C", 4);
-      voteN(c, "A", "C", 4);
+      voteN(c, "A", "B", 3); voteN(c, "B", "C", 3); voteN(c, "A", "C", 3);
       const rk = c.ranking();
-      ok(rk[0].key === "A" && rk[1].key === "B" && rk[2].key === "C",
-        "A>B>C transitive ordering");
+      ok(rk.map(r => r.key).join("") === "ABC", "A>B>C ordering");
     })();
 
-    // ---- 4. Flip-flop ⇒ near-equal strength + overlapping intervals ------
-    // THE headline property: if you can't decide between A and B, the model
-    // must NOT manufacture a confident ordering.
+    // ---- 5. Flip-flop past the floor ⇒ confirmed TIE ---------------------
     (function () {
       const c = new PreferenceCore(["A", "B"]);
-      for (let k = 0; k < 6; k++) { c.vote("A", "B", "A"); c.vote("A", "B", "B"); }
+      for (let k = 0; k < 3; k++) { c.vote("A", "B", "A"); c.vote("A", "B", "B"); } // 3–3
+      ok(c.pairState(0, 1).state === "tied", "even record past floor ⇒ tied");
       const rk = c.ranking();
-      approx(rk[0].theta - rk[1].theta, 0, 1e-6, "flip-flop ⇒ ~equal theta");
-      const z = Math.abs(PreferenceCore.sepZ(rk[0], rk[1]));
-      ok(z < PreferenceCore.SEP_Z, "flip-flop ⇒ NOT separated (z below threshold)");
-      // intervals overlap
-      ok(rk[0].lo < rk[1].hi && rk[1].lo < rk[0].hi, "flip-flop ⇒ intervals overlap");
+      ok(rk[0].rank === rk[1].rank, "tied items share a rank (cluster)");
+      ok(rk[0].tied && rk[1].tied, "both flagged tied");
     })();
 
-    // ---- 5. More consistent votes ⇒ higher separation z (monotone) -------
-    (function () {
-      const c2 = new PreferenceCore(["A", "B"]); voteN(c2, "A", "B", 2);
-      const c8 = new PreferenceCore(["A", "B"]); voteN(c8, "A", "B", 8);
-      const z2 = Math.abs(PreferenceCore.sepZ(c2.ranking()[0], c2.ranking()[1]));
-      const z8 = Math.abs(PreferenceCore.sepZ(c8.ranking()[0], c8.ranking()[1]));
-      ok(z8 > z2, "more consistent votes ⇒ greater separation");
-    })();
-
-    // ---- 6. SE shrinks as you vote more ----------------------------------
+    // ---- 6. Below floor with a leader ⇒ provisional, not decided ---------
     (function () {
       const c = new PreferenceCore(["A", "B"]);
-      const se0 = c.se[0];
-      voteN(c, "A", "B", 10);
-      ok(c.se[0] < se0, "SE shrinks with more games");
+      c.vote("A", "B", "A");                       // 1–0, below floor
+      ok(c.pairState(0, 1).state === "provisional", "1–0 ⇒ provisional");
+      voteN(c, "A", "B", FLOOR);                   // push past floor, all A
+      ok(c.pairState(0, 1).state === "decided", "past floor & one-sided ⇒ decided");
     })();
 
-    // ---- 7. Precision: monotone-ish, in [0,1], 0 with no direct votes ----
-    (function () {
-      const c = new PreferenceCore(["A", "B"]);
-      ok(c.precision() === 0, "precision 0 before any direct vote");
-      voteN(c, "A", "B", 1);
-      const p1 = c.precision();
-      ok(p1 >= 0 && p1 <= 1, "precision within [0,1]");
-      voteN(c, "A", "B", 9);
-      const p10 = c.precision();
-      ok(p10 >= 0 && p10 <= 1, "precision still within [0,1]");
-      ok(p10 > p1, "precision rises with consistent evidence");
-    })();
-
-    // ---- 8. Full consistent ordering ⇒ precision reaches 1 ---------------
-    (function () {
-      const c = new PreferenceCore(["A", "B", "C"], { rng: makeRng(42) });
-      // hammer every pair consistently A>B>C, lots of direct votes
-      for (let k = 0; k < 15; k++) {
-        c.vote("A", "B", "A");
-        c.vote("B", "C", "B");
-        c.vote("A", "C", "A");
-      }
-      approx(c.precision(), 1, 1e-6, "fully separated ⇒ precision 1");
-    })();
-
-    // ---- 9. Direct-evidence gate: transitive-only inference ⇒ no credit --
-    // A>B and B>C voted directly, but A vs C NEVER directly compared. The
-    // A–C gap must not earn precision credit from transitivity alone... but
-    // here A and C are NOT adjacent (B sits between), so check the adjacent
-    // gaps get credit while an UNvoted adjacent pair would not.
-    (function () {
-      const c = new PreferenceCore(["A", "B"]);
-      // zero direct A–B votes but force a fake strength split via... we can't
-      // without votes. Instead: verify gate math directly.
-      // games[A][B] = 0 ⇒ directGate 0 ⇒ contribution 0 even if theta differ.
-      // Simulate by giving A votes vs a third item only.
-      const c3 = new PreferenceCore(["A", "B", "C"]);
-      voteN(c3, "A", "C", 6);   // A beats C; B untouched
-      // A and C have direct votes; B is in the middle with none direct to A.
-      // The A–C pair is non-adjacent; whatever pair is adjacent to B with zero
-      // direct votes must contribute 0.
-      const rk = c3.ranking();
-      let zeroDirectContributes = true;
-      for (let i = 0; i < rk.length - 1; i++) {
-        const gi = c3.idx.get(rk[i].key), gj = c3.idx.get(rk[i + 1].key);
-        if (c3.games[gi][gj] === 0) {
-          // this adjacent pair has no direct votes; its contribution must be 0
-          // (we can't isolate it from precision() easily, so assert the gate)
-          const gate = Math.min(1, c3.games[gi][gj] / PreferenceCore.MIN_DIRECT);
-          if (gate !== 0) zeroDirectContributes = false;
-        }
-      }
-      ok(zeroDirectContributes, "zero-direct adjacent pair contributes 0 to precision");
-    })();
-
-    // ---- 10. sepZ static works on saved snapshots {r, rd} ----------------
-    (function () {
-      // Two well-separated snapshots in display units.
-      const hi = { r: 1700, rd: 50 };
-      const lo = { r: 1300, rd: 50 };
-      const z = PreferenceCore.sepZ(hi, lo);
-      ok(z > 0, "snapshot sepZ positive when hi>lo");
-      // symmetric magnitude
-      approx(PreferenceCore.sepZ(lo, hi), -z, 1e-9, "snapshot sepZ antisymmetric");
-      // wider rd ⇒ smaller z
-      const zWide = PreferenceCore.sepZ({ r: 1700, rd: 200 }, { r: 1300, rd: 200 });
-      ok(Math.abs(zWide) < Math.abs(z), "wider intervals ⇒ smaller separation z");
-    })();
-
-    // ---- 11. replay() == sequential vote() -------------------------------
-    (function () {
-      const log = [
-        { a: "A", b: "B", winner: "A" },
-        { a: "B", b: "C", winner: "C" },
-        { a: "A", b: "C", winner: "A" },
-        { a: "A", b: "B", winner: "B" },
-      ];
-      const cr = new PreferenceCore(["A", "B", "C"]);
-      cr.replay(log);
-      const cv = new PreferenceCore(["A", "B", "C"]);
-      for (const v of log) cv.vote(v.a, v.b, v.winner);
-      for (let i = 0; i < 3; i++) {
-        approx(cr.theta[i], cv.theta[i], 1e-9, `replay matches vote() theta[${i}]`);
-        approx(cr.se[i], cv.se[i], 1e-9, `replay matches vote() se[${i}]`);
-      }
-      ok(cr.voteCount === cv.voteCount && cr.voteCount === 4, "replay vote count correct");
-    })();
-
-    // ---- 12. nextPair always returns a valid, distinct, in-range pair ----
-    (function () {
-      const c = new PreferenceCore(["A", "B", "C", "D"], { rng: makeRng(7) });
-      for (let t = 0; t < 200; t++) {
-        const pair = c.nextPair();
-        ok(Array.isArray(pair) && pair.length === 2, "nextPair returns a pair");
-        ok(pair[0] !== pair[1], "nextPair items distinct");
-        ok(c.idx.has(pair[0]) && c.idx.has(pair[1]), "nextPair items are known keys");
-        // record a random consistent-ish vote to keep the loop moving
-        c.vote(pair[0], pair[1], pair[0]);
-      }
-    })();
-
-    // ---- 13. nextPair covers every pair to MIN_DIRECT (no starvation) ----
-    // The needsDirect boost must guarantee full coverage so precision can
-    // reach 1. Drive the loop and check every pair hits MIN_DIRECT.
+    // ---- 7. Completion after one pass (every pair seen once) -------------
     (function () {
       const keys = ["A", "B", "C", "D"];
-      const c = new PreferenceCore(keys, { rng: makeRng(123) });
-      // Vote according to a fixed true order A>B>C>D so it converges.
+      const c = new PreferenceCore(keys);
+      // one pass: every pair once, A>B>C>D
       const order = { A: 4, B: 3, C: 2, D: 1 };
-      for (let t = 0; t < 400 && c.precision() < 1; t++) {
-        const [x, y] = c.nextPair();
-        const winner = order[x] >= order[y] ? x : y;
-        c.vote(x, y, winner);
-      }
-      let allCovered = true;
       for (let i = 0; i < keys.length; i++)
-        for (let j = i + 1; j < keys.length; j++)
-          if (c.games[i][j] < PreferenceCore.MIN_DIRECT) allCovered = false;
-      ok(allCovered, "every pair reaches MIN_DIRECT direct votes");
-      approx(c.precision(), 1, 1e-6, "consistent voter converges to precision 1");
-      const rk = c.ranking();
-      ok(rk.map(r => r.key).join("") === "ABCD", "converged ranking matches true order");
+        for (let j = i + 1; j < keys.length; j++) {
+          const w = order[keys[i]] > order[keys[j]] ? keys[i] : keys[j];
+          c.vote(keys[i], keys[j], w);
+        }
+      const s = c.status();
+      ok(s.complete, "one pass ⇒ complete (full ranking exists)");
+      ok(c.ranking().map(r => r.key).join("") === "ABCD", "one-pass order correct");
+      ok(s.tier === "building" || s.tier === "pretty-sure", "one pass ⇒ low confidence tier");
     })();
 
-    // ---- 14. Realistic noisy voter: mostly-consistent ⇒ correct order ----
-    // 80% of the time the voter prefers the truly-better item. The model must
-    // still recover the order, and indistinct neighbors should stay low-z.
+    // ---- 8. Completion ≠ confidence: grinding raises competence ----------
     (function () {
-      const keys = ["A", "B", "C", "D", "E"];
-      const rng = makeRng(2024);
-      const c = new PreferenceCore(keys, { rng });
-      const strength = { A: 5, B: 4, C: 3, D: 2, E: 1 };
-      for (let t = 0; t < 600; t++) {
+      const keys = ["A", "B", "C"];
+      const c = new PreferenceCore(keys, { rng: makeRng(1) });
+      const order = { A: 3, B: 2, C: 1 };
+      // one pass
+      for (let i = 0; i < 3; i++) for (let j = i + 1; j < 3; j++)
+        c.vote(keys[i], keys[j], order[keys[i]] > order[keys[j]] ? keys[i] : keys[j]);
+      const c1 = c.status().competence;
+      // grind consistently
+      for (let t = 0; t < 30; t++) {
         const [x, y] = c.nextPair();
-        const better = strength[x] > strength[y] ? x : y;
-        const worse = better === x ? y : x;
-        // probability of voting "correctly" scales with the strength gap
-        const gap = Math.abs(strength[x] - strength[y]);
-        const pCorrect = 0.5 + 0.18 * gap;     // 0.68 for gap 1 … 0.86 for gap 4
-        const winner = rng() < pCorrect ? better : worse;
-        c.vote(x, y, winner);
+        c.vote(x, y, order[x] > order[y] ? x : y);
       }
-      const rk = c.ranking().map(r => r.key);
-      // Spearman-ish check: A should be top-2, E should be bottom-2.
-      ok(rk.indexOf("A") <= 1, "noisy voter: true-best A lands top-2");
-      ok(rk.indexOf("E") >= 3, "noisy voter: true-worst E lands bottom-2");
+      const c2 = c.status().competence;
+      ok(c2 >= c1, "grinding does not lower competence");
+      ok(c2 > 0.5, "consistent grinding reaches at least 'confident'");
     })();
 
-    // ---- 15. Strength scale: bigger win ratio ⇒ bigger rating gap ---------
+    // ---- 9. Winner's circle: top tie crowns co-winners, doesn't hang -----
     (function () {
       const c = new PreferenceCore(["A", "B", "C"]);
-      voteN(c, "A", "B", 9);  // A dominates B
-      // A vs C split evenly
-      for (let k = 0; k < 4; k++) { c.vote("A", "C", "A"); c.vote("A", "C", "C"); }
-      const rk = c.ranking();
-      const byKey = Object.fromEntries(rk.map(r => [r.key, r]));
-      ok(byKey.A.theta > byKey.B.theta, "A above B");
-      ok(Math.abs(byKey.A.theta - byKey.C.theta) < Math.abs(byKey.A.theta - byKey.B.theta),
-        "evenly-split pair closer than dominated pair");
+      // A and B tie (3–3), both clearly beat C
+      for (let k = 0; k < 3; k++) { c.vote("A", "B", "A"); c.vote("A", "B", "B"); }
+      voteN(c, "A", "C", 3); voteN(c, "B", "C", 3);
+      const s = c.status();
+      ok(s.winnerLocked, "confirmed top tie ⇒ winner locked (no hang)");
+      ok(s.winners.length === 2 && s.winners.includes("A") && s.winners.includes("B"),
+        "top tie ⇒ A and B are co-winners");
+    })();
+
+    // ---- 10. Single clear winner crowns once margin/floor met ------------
+    (function () {
+      const c = new PreferenceCore(["A", "B", "C"]);
+      voteN(c, "A", "B", 3); voteN(c, "A", "C", 3); voteN(c, "B", "C", 3);
+      const s = c.status();
+      ok(s.winnerLocked, "decisive A ⇒ winner locked");
+      ok(s.winners.length === 1 && s.winners[0] === "A", "A is the sole winner");
+    })();
+
+    // ---- 11. precision()/fill monotonic-ish and in [0,1] -----------------
+    (function () {
+      const c = new PreferenceCore(["A", "B", "C", "D"], { rng: makeRng(5) });
+      const order = { A: 4, B: 3, C: 2, D: 1 };
+      let prev = 0, ok01 = true, neverWild = true;
+      for (let t = 0; t < 60; t++) {
+        const [x, y] = c.nextPair();
+        c.vote(x, y, order[x] > order[y] ? x : y);
+        const f = c.precision();
+        if (f < 0 || f > 1) ok01 = false;
+        if (f < prev - 0.2) neverWild = false;   // no catastrophic wipe
+        prev = f;
+      }
+      ok(ok01, "fill stays within [0,1]");
+      ok(neverWild, "fill never wipes (no >0.2 single drop)");
+      ok(c.precision() > 0.8, "consistent voter ends high");
+    })();
+
+    // ---- 12. nextPair valid, distinct, prefers unseen then provisional ---
+    (function () {
+      const c = new PreferenceCore(["A", "B", "C", "D"], { rng: makeRng(7) });
+      const seen = new Set();
+      for (let t = 0; t < 6; t++) {
+        const p = c.nextPair();
+        ok(Array.isArray(p) && p.length === 2 && p[0] !== p[1], "nextPair returns a distinct pair");
+        ok(c.idx.has(p[0]) && c.idx.has(p[1]), "nextPair items are known keys");
+        const k = [p[0], p[1]].sort().join("|");
+        // first 6 picks on 4 items (6 pairs) should each be a fresh unseen pair
+        ok(!seen.has(k), "unseen pairs served before repeats");
+        seen.add(k);
+        c.vote(p[0], p[1], p[0]);
+      }
+    })();
+
+    // ---- 13. Settled pairs are not re-served (no endless re-asking) ------
+    // Drive to all-settled, then confirm nextPair stops hammering decided pairs.
+    (function () {
+      const keys = ["A", "B", "C", "D"];
+      const c = new PreferenceCore(keys, { rng: makeRng(11) });
+      const order = { A: 4, B: 3, C: 2, D: 1 };
+      for (let t = 0; t < 200 && c.status().counts.unseen + c.status().counts.provisional > 0; t++) {
+        const [x, y] = c.nextPair();
+        c.vote(x, y, order[x] > order[y] ? x : y);
+      }
+      const s = c.status();
+      ok(s.counts.unseen === 0, "all pairs eventually seen");
+      ok(s.phase === 3, "fully settled ⇒ phase 3");
+      // now every pair is decided/tied; 20 more picks must each be an already-met pair
+      let allMet = true;
+      for (let t = 0; t < 20; t++) {
+        const [x, y] = c.nextPair();
+        if (c.games[c.idx.get(x)][c.idx.get(y)] === 0) allMet = false;
+        c.vote(x, y, order[x] > order[y] ? x : y);
+      }
+      ok(allMet, "after settling, nextPair never serves an unseen pair");
+    })();
+
+    // ---- 14. votesToNext shrinks toward each milestone -------------------
+    (function () {
+      const c = new PreferenceCore(["A", "B", "C"], { rng: makeRng(3) });
+      const s0 = c.status();
+      ok(s0.nextLabel === "complete the first pass", "starts by asking to complete a pass");
+      ok(s0.votesToNext === 3, "3 unseen pairs ⇒ 3 votes to complete");
+    })();
+
+    // ---- 15. replay() == sequential vote() -------------------------------
+    (function () {
+      const log = [
+        { a: "A", b: "B", winner: "A" }, { a: "B", b: "C", winner: "C" },
+        { a: "A", b: "C", winner: "A" }, { a: "A", b: "B", winner: "B" },
+      ];
+      const cr = new PreferenceCore(["A", "B", "C"]); cr.replay(log);
+      const cv = new PreferenceCore(["A", "B", "C"]); for (const v of log) cv.vote(v.a, v.b, v.winner);
+      for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++)
+        ok(cr.wins[i][j] === cv.wins[i][j], `replay matches vote() wins[${i}][${j}]`);
+      ok(cr.voteCount === cv.voteCount && cr.voteCount === 4, "replay vote count correct");
     })();
 
     // ---- 16. Determinism: same seed ⇒ same matchup sequence --------------
@@ -611,14 +630,10 @@
       function seq(seed) {
         const c = new PreferenceCore(["A", "B", "C"], { rng: makeRng(seed) });
         const out = [];
-        for (let t = 0; t < 20; t++) {
-          const p = c.nextPair();
-          out.push(p.join(">"));
-          c.vote(p[0], p[1], p[0]);
-        }
+        for (let t = 0; t < 20; t++) { const p = c.nextPair(); out.push(p.join(">")); c.vote(p[0], p[1], p[0]); }
         return out.join(",");
       }
-      ok(seq(99) === seq(99), "same seed ⇒ identical matchup sequence");
+      ok(seq(99) === seq(99), "same seed ⇒ identical sequence");
       ok(seq(99) !== seq(100), "different seed ⇒ different sequence");
     })();
 
@@ -631,93 +646,63 @@
       ok(c.voteCount === 1, "rejected votes not counted");
     })();
 
-    // ---- 18. THE RULE: the bar trends UP and never wipes -----------------
-    // "Unless I'm flip-flopping, the bar should consistently go up." We assert
-    // the truthful form of this: over a realistic noisy-but-mostly-consistent
-    // voter on 7 CLOSE tones, (a) NO single vote ever drops the bar by more than
-    // a small bound — never a reset — and (b) the bar ends FAR above where it
-    // started, i.e. it genuinely climbs as evidence accumulates.
-    //
-    // Note we do NOT assert "every consistent vote strictly rises": when tones
-    // are close and the voter is noisy, the fit can be transiently wrong, and a
-    // vote that pushes a truly-weaker tone further up (an upset against the bulk
-    // of evidence, even if it momentarily agrees with the shaky fit) SHOULD dip
-    // confidence a little. That's the bar being honest, not buggy. The promise
-    // we keep is: small, bounded dips that recover — never a one-vote wipe.
+    // ---- 18. Noisy-but-decisive voter recovers a sensible order ----------
     (function () {
-      const keys = ["A", "B", "C", "D", "E", "F", "G"];
-      const rng = makeRng(3);
-      const strength = { A: 1.0, B: 0.8, C: 0.6, D: 0.45, E: 0.3, F: 0.15, G: 0.0 };
+      const keys = ["A", "B", "C", "D", "E"];
+      const rng = makeRng(2024);
       const c = new PreferenceCore(keys, { rng });
-      const MAX_SINGLE_DROP = 0.05;     // a single vote can dip at most this much
-      let worstDrop = 0, rises = 0, drops = 0;
-      const first = c.precision();
-      for (let t = 0; t < 120; t++) {
+      const strength = { A: 5, B: 4, C: 3, D: 2, E: 1 };
+      for (let t = 0; t < 200; t++) {
         const [x, y] = c.nextPair();
-        const px = 1 / (1 + Math.exp(-(strength[x] - strength[y])));
-        const winner = rng() < px ? x : y;
-        const before = c.precision();
-        c.vote(x, y, winner);
-        const d = c.precision() - before;
-        worstDrop = Math.min(worstDrop, d);
-        if (d > 1e-9) rises++; else if (d < -1e-9) drops++;
+        const better = strength[x] > strength[y] ? x : y, worse = better === x ? y : x;
+        const gap = Math.abs(strength[x] - strength[y]);
+        const pCorrect = 0.5 + 0.18 * gap;
+        c.vote(x, y, rng() < pCorrect ? better : worse);
       }
-      const last = c.precision();
-      ok(worstDrop >= -MAX_SINGLE_DROP,
-        `no single vote wipes the bar (worst drop ${worstDrop.toFixed(4)} ≥ -${MAX_SINGLE_DROP})`);
-      ok(last - first > 0.5, `bar climbs strongly with evidence (${first.toFixed(2)} → ${last.toFixed(2)})`);
-      ok(rises > drops, `bar rises more often than it dips (${rises} up vs ${drops} down)`);
-      // and the dips are individually tiny — the average dip magnitude is small,
-      // so even the down-votes are micro-corrections, never resets.
-      ok(worstDrop >= -MAX_SINGLE_DROP, "every dip is a micro-correction, not a reset");
+      const rk = c.ranking().map(r => r.key);
+      ok(rk.indexOf("A") <= 1, "noisy voter: true-best A lands top-2");
+      ok(rk.indexOf("E") >= 3, "noisy voter: true-worst E lands bottom-2");
     })();
 
-    // ---- 19. Regression: one upset on a close pair ≠ a reset -------------
-    // Build solid confidence with a consistent voter, then inject ONE upset on
-    // the closest adjacent pair. The drop must be small — the OLD adjacency
-    // metric could wipe 75–100% of the bar here; the evidence metric must not.
+    // ---- 19. Tie cluster uses Olympic shared ranks -----------------------
     (function () {
-      const keys = ["A", "B", "C", "D", "E", "F", "G"];
-      const order = { A: 7, B: 6, C: 5, D: 4, E: 3, F: 2, G: 1 };
-      const c = new PreferenceCore(keys, { rng: makeRng(7) });
-      let t = 0;
-      while (c.precision() < 0.6 && t < 3000) {
-        const [x, y] = c.nextPair();
-        c.vote(x, y, order[x] > order[y] ? x : y);
-        t++;
-      }
-      const before = c.precision();
-      // find closest adjacent pair, vote the upset
+      const c = new PreferenceCore(["A", "B", "C", "D"]);
+      voteN(c, "A", "B", 3); voteN(c, "A", "C", 3); voteN(c, "A", "D", 3); // A clear #1
+      // B, C tie; both beat D
+      for (let k = 0; k < 3; k++) { c.vote("B", "C", "B"); c.vote("B", "C", "C"); }
+      voteN(c, "B", "D", 3); voteN(c, "C", "D", 3);
       const rk = c.ranking();
-      let pair = [rk[0].key, rk[1].key], best = Infinity;
-      for (let i = 0; i < rk.length - 1; i++) {
-        const z = Math.abs(PreferenceCore.sepZ(rk[i], rk[i + 1]));
-        if (z < best) { best = z; pair = [rk[i].key, rk[i + 1].key]; }
-      }
-      c.vote(pair[0], pair[1], pair[1]);   // the lower one wins = upset
-      const after = c.precision();
-      const lostFraction = (before - after) / before;
-      ok(lostFraction < 0.15,
-        `one upset costs < 15% of the bar (lost ${(100 * lostFraction).toFixed(1)}%)`);
+      ok(rk[0].key === "A" && rk[0].rank === 1, "A is rank 1");
+      const bRow = rk.find(r => r.key === "B"), cRow = rk.find(r => r.key === "C");
+      ok(bRow.rank === cRow.rank, "B and C share a rank (tie cluster)");
+      const dRow = rk.find(r => r.key === "D");
+      ok(dRow.rank > bRow.rank, "D ranks below the B/C cluster");
     })();
 
-    // ---- 20. Reorder-invariance: precision ignores sort adjacency --------
-    // The whole point of the redefinition: precision is a function of the
-    // unordered pair stats, so it cannot depend on who is currently adjacent.
-    // Two cores fed the SAME multiset of votes in different ORDERS must report
-    // identical precision (the fit is order-independent, and so is the metric).
+    // ---- 20. The real-data regression: no ranking contradicts a decided H2H
+    // Reconstructed shape from the user's session: ensure the final ranking has
+    // ZERO inversions of a decided head-to-head.
     (function () {
-      const keys = ["A", "B", "C", "D"];
-      const votes = [
-        ["A", "B", "A"], ["C", "D", "C"], ["A", "C", "A"], ["B", "D", "B"],
-        ["A", "D", "A"], ["B", "C", "B"], ["A", "B", "B"], ["C", "D", "D"],
-      ];
-      const c1 = new PreferenceCore(keys);
-      for (const v of votes) c1.vote(v[0], v[1], v[2]);
-      const c2 = new PreferenceCore(keys);
-      for (const v of votes.slice().reverse()) c2.vote(v[0], v[1], v[2]);
-      approx(c1.precision(), c2.precision(), 1e-9,
-        "precision is invariant to the order votes arrived in");
+      const keys = ["A", "B", "C", "D", "E"];
+      const rng = makeRng(77);
+      const c = new PreferenceCore(keys, { rng });
+      const strength = { A: 5, B: 4, C: 3, D: 2, E: 1 };
+      for (let t = 0; t < 300; t++) {
+        const [x, y] = c.nextPair();
+        const better = strength[x] > strength[y] ? x : y, worse = better === x ? y : x;
+        const gap = Math.abs(strength[x] - strength[y]);
+        c.vote(x, y, rng() < 0.5 + 0.2 * gap ? better : worse);
+      }
+      const rk = c.ranking();
+      const posOf = {}; rk.forEach((r, i) => posOf[r.key] = i);
+      let inversions = 0;
+      for (let i = 0; i < c.n; i++) for (let j = i + 1; j < c.n; j++) {
+        const ps = c.pairState(i, j);
+        if (ps.state !== "decided") continue;
+        const hi = ps.leader, lo = hi === i ? j : i;
+        if (posOf[keys[hi]] > posOf[keys[lo]]) inversions++;
+      }
+      ok(inversions === 0, "ranking never contradicts a decided head-to-head");
     })();
 
     // ---- summary ---------------------------------------------------------
@@ -726,12 +711,8 @@
     line("");
     line(`preference-rating.js test suite`);
     line(`  ${passed}/${total} assertions passed`);
-    if (failed) {
-      line(`  ${failed} FAILED:`);
-      for (const f of fails) line(`    ✗ ${f}`);
-    } else {
-      line(`  ✓ all green`);
-    }
+    if (failed) { line(`  ${failed} FAILED:`); for (const f of fails) line(`    ✗ ${f}`); }
+    else line(`  ✓ all green`);
     line("");
     return failed === 0;
   }

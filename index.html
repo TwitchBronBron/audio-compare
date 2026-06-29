@@ -394,9 +394,11 @@
   </section>
 </main>
 
-<!-- Pure rating math (Bradley–Terry MLE + precision). Shared, unit-tested core;
-     run `node compare/preference-rating.js` to exercise its test suite. -->
-<script src="preference-rating.js"></script>
+<!-- Pure head-to-head ranking core (see DESIGN.md). Shared, unit-tested;
+     run `node compare/preference-rating.js` to exercise its test suite.
+     ?v= is a cache-buster — bump it whenever the core changes so browsers
+     don't run a stale copy (that caused "this.core.status is not a function"). -->
+<script src="preference-rating.js?v=2"></script>
 <script>
 "use strict";
 
@@ -758,8 +760,8 @@ function setupWaveform(track, canvas, color, getKey) {
  * in a separate, tested module is deliberate — the ranking must be trustworthy.
  *
  * `PreferenceRater` mirrors the small surface the rest of this file uses:
- *   .replay(log) .record(cb) .run() .finish() .ranking() .precision() .voteCount
- * and re-exports the core's statics (SCALE/Z/SEP_Z/sepZ) for the results UI.
+ *   .replay(log) .record(cb) .run() .finish() .ranking() .precision() .status() .voteCount
+ * and re-exports the core's constants (MEET_FLOOR/DECIDE_FRAC/WIN_MARGIN).
  *
  * ranking() rows here carry the full {item} object (the UI needs name/url),
  * layered on top of the core's {key, theta, se, r, rd, lo, hi}.
@@ -768,13 +770,10 @@ function setupWaveform(track, canvas, color, getKey) {
 const PreferenceCore = window.PreferenceCore;
 
 class PreferenceRater {
-  // re-export the core's statics so existing call sites (PreferenceRater.sepZ,
-  // .SCALE, .Z, .SEP_Z, .MIN_DIRECT) keep working unchanged.
-  static get SCALE() { return PreferenceCore.SCALE; }
-  static get Z() { return PreferenceCore.Z; }
-  static get SEP_Z() { return PreferenceCore.SEP_Z; }
-  static get MIN_DIRECT() { return PreferenceCore.MIN_DIRECT; }
-  static sepZ(a, b) { return PreferenceCore.sepZ(a, b); }
+  // re-export the core's constants for the UI.
+  static get MEET_FLOOR() { return PreferenceCore.MEET_FLOOR; }
+  static get DECIDE_FRAC() { return PreferenceCore.DECIDE_FRAC; }
+  static get WIN_MARGIN() { return PreferenceCore.WIN_MARGIN; }
 
   constructor(items) {
     this.items = items;                       // [{file, name, key, url}]
@@ -798,6 +797,7 @@ class PreferenceRater {
   }
 
   precision() { return this.core.precision(); }
+  status() { return this.core.status(); }
 
   run() {
     this._running = true;
@@ -1063,12 +1063,15 @@ async function startSet(folder, opts) {
     const ranked = await rater.run();    // resolves when the user clicks "Done"
     state.done = true;
     state.ranking = ranked.map(it => it.file);
-    // snapshot the rating + interval per file so the results screen can show how
-    // far apart tracks are (and flag statistical ties) even after a reload.
+    // snapshot per-file ranking info so the results screen can show the score,
+    // cluster rank, and tie flags even after a reload (no live core needed).
     const rk = rater.ranking();
     state.scores = {};
     for (const row of rk) {
-      state.scores[row.item.file] = { r: row.r, rd: row.rd, lo: row.lo, hi: row.hi };
+      state.scores[row.item.file] = {
+        r: row.r, score: row.score, rank: row.rank, tied: row.tied,
+        wins: row.wins, losses: row.losses,
+      };
     }
     Store.save(folder, state);
     showResults(ranked, { scores: state.scores });
@@ -1134,27 +1137,61 @@ function buildLane(opts) {
   return lane;
 }
 
-// Map a precision fraction (0..1) to a tier label, MKBHD-style good/better/best.
-function precisionTier(p) {
-  if (p >= 1)    return "best — every track is statistically separated";
-  if (p >= 0.66) return "better — almost there, a few close calls left";
-  if (p >= 0.33) return "good — you can stop here, or keep going for more confidence";
-  return "building confidence — keep voting";
+// Human label for the competence tier (felt sureness, not a p-value).
+const TIER_LABEL = {
+  "building":    "building your ranking",
+  "pretty-sure": "Pretty sure",
+  "confident":   "Confident",
+  "rock-solid":  "Rock solid",
+};
+
+// Build the line under the bar from the engine's phase/status. Always names the
+// phase and the SMALL, reachable next milestone (never the far finish line) —
+// "~N votes to find your winner" keeps people from leaving.
+function statusLine(s, voteCount) {
+  const votes = voteCount + " vote" + (voteCount === 1 ? "" : "s");
+  const tier = TIER_LABEL[s.tier] || s.tier;
+  const n = s.votesToNext;
+  const more = n > 0 ? ` — ~${n} more to ${s.nextLabel}` : "";
+  if (!s.complete) {
+    // still completing the first pass: every pair seen at least once
+    return `${votes} · building your ranking${more}`;
+  }
+  if (s.phase === 1) {
+    return `${votes} · no clear winner yet${more}`;
+  }
+  // winner (or co-winners) locked
+  const who = s.winners.length > 1
+    ? `🏆 Tied for the win: ${s.winners.map(displayWinner).join(" & ")}`
+    : `🏆 Winner: ${displayWinner(s.winners[0])}`;
+  if (s.phase === 2) {
+    return `${who} · ${tier} — you can stop now${more}`;
+  }
+  // phase 3: fully settled, only confidence left to gain
+  return `${who} · ${tier} · ranking settled — keep voting only to raise confidence`;
 }
 
-// Update the precision bar + readout from the rater's current state.
+// Map an item key to a readable winner name for the status line.
+function displayWinner(key) {
+  const it = rater && rater.itemByKey && rater.itemByKey.get(key);
+  return it ? it.name || it.file.replace(/\.[^.]+$/, "") : key;
+}
+
+// Update the progress bar + readout from the rater's current status.
 function updatePrecision() {
   if (!rater) return;
-  const p = rater.precision();
-  els.progressFill.style.width = Math.round(p * 100) + "%";
-  els.compareCount.textContent =
-    rater.voteCount + " vote" + (rater.voteCount === 1 ? "" : "s") + " · " + precisionTier(p);
+  const s = rater.status();
+  els.progressFill.style.width = Math.round(s.fill * 100) + "%";
+  els.compareCount.textContent = statusLine(s, rater.voteCount);
 
+  // bar markers now mean: good = winner locked, better = top settled,
+  // best = fully settled & high confidence (the "good enough to stop" marker
+  // is at the phase-2 boundary, i.e. "better").
   const bar = document.querySelector(".progress-bar.precision");
   if (bar) {
-    bar.classList.toggle("lit-good",   p >= 0.33);
-    bar.classList.toggle("lit-better", p >= 0.66);
-    bar.classList.toggle("lit-best",   p >= 1);
+    bar.classList.toggle("lit-good",   s.winnerLocked);
+    bar.classList.toggle("lit-better", s.stopOk);
+    bar.classList.toggle("lit-best",   s.phase === 3 && s.tier === "rock-solid");
   }
 
   if (DEBUG) renderDebug();
@@ -1166,37 +1203,33 @@ function updatePrecision() {
  * precision() is computing from. Refreshes on every vote via updatePrecision.
  * ------------------------------------------------------------------ */
 
-// Compute the same per-pair quantities precision() uses, for display + copy.
-// Returns { rows, ranking, precision, voteCount, mismatch }.
+// Per-pair head-to-head breakdown for the debug panel + diagnostic copy.
+// Returns { rows, ranking, status, voteCount }.
 function debugSnapshot() {
   const core = rater && rater.core;
   if (!core) return null;
-  const Core = window.PreferenceCore;
   const n = core.n;
   const rows = [];
   for (let i = 0; i < n; i++) {
     for (let j = i + 1; j < n; j++) {
-      const a = { theta: core.theta[i], se: core.se[i] };
-      const b = { theta: core.theta[j], se: core.se[j] };
-      const z = Math.abs(Core.sepZ(a, b));
-      const sep = Math.max(0, Math.min(1, z / Core.SEP_Z));
-      const gate = Math.min(1, core.games[i][j] / Core.MIN_DIRECT);
-      const resolved = gate * Math.max(sep, gate * (1 - sep));
+      const ps = core.pairState(i, j);
       rows.push({
         a: core.keys[i], b: core.keys[j],
-        games: core.games[i][j],
-        winsA: core.wins[i][j], winsB: core.wins[j][i],
-        z, sep, gate, resolved,
-        isTie: gate >= 1 && sep < 1,        // enough evidence AND still close
+        games: ps.games, winsA: ps.wins, winsB: ps.loss,
+        state: ps.state,
+        leader: ps.leader == null ? "—" : core.keys[ps.leader],
+        isTie: ps.state === "tied",
+        unsettled: ps.state === "unseen" || ps.state === "provisional",
       });
     }
   }
-  // sort worst-resolved first so problem pairs are at the top
-  rows.sort((x, y) => x.resolved - y.resolved);
+  // sort least-settled first so problem pairs are at the top
+  const rank = { unseen: 0, provisional: 1, tied: 2, decided: 3 };
+  rows.sort((x, y) => (rank[x.state] - rank[y.state]) || (x.games - y.games));
   return {
     rows,
     ranking: rater.ranking(),
-    precision: core.precision(),
+    status: core.status(),
     voteCount: core.voteCount,
   };
 }
@@ -1218,29 +1251,33 @@ function renderDebug() {
   if (!snap) { body.innerHTML = '<p class="muted">no active rater</p>'; return; }
 
   const pct = (x) => (100 * x).toFixed(0) + "%";
-  const f3 = (x) => (isFinite(x) ? x.toFixed(3) : "∞");
+  const s = snap.status;
 
-  // ranking table
-  let html = `<table><caption>ranking · precision ${pct(snap.precision)} · ${snap.voteCount} votes</caption>`;
-  html += "<tr><th>#</th><th>track</th><th>rating</th><th>±</th><th>SE(θ)</th></tr>";
-  snap.ranking.forEach((r, i) => {
-    html += `<tr><td>${i + 1}</td><td>${escapeHtml(debugName(r.key))}</td>` +
-            `<td>${Math.round(r.r)}</td><td>±${Math.round(r.rd)}</td><td>${f3(r.se)}</td></tr>`;
+  // ranking table — cluster rank, net matchup score, decided W–L
+  let html = `<table><caption>ranking · bar ${pct(s.fill)} · ${TIER_LABEL[s.tier] || s.tier}` +
+             ` · phase ${s.phase} · ${snap.voteCount} votes</caption>`;
+  html += "<tr><th>#</th><th>track</th><th>score</th><th>decided W–L</th><th>tie</th></tr>";
+  snap.ranking.forEach((r) => {
+    html += `<tr${r.tied ? ' class="is-tie"' : ""}><td>${r.rank}</td><td>${escapeHtml(debugName(r.key))}</td>` +
+            `<td>${r.score}</td><td>${r.wins}–${r.losses}</td><td>${r.tied ? "≈" : ""}</td></tr>`;
   });
   html += "</table>";
 
-  // per-pair table (worst-resolved first)
-  html += `<table><caption>pairs (worst-resolved first) — “resolved” is each pair’s contribution to the bar</caption>`;
-  html += "<tr><th>pair</th><th>games</th><th>W–L</th><th>z</th><th>sep</th><th>gate</th><th>resolved</th></tr>";
+  // status summary
+  html += `<table><caption>status — winner ${s.winnerLocked ? "locked: " + s.winners.map(debugName).join(", ") : "not yet"}` +
+          ` · competence ${pct(s.competence)} · next: ${s.nextLabel}${s.votesToNext ? " (~" + s.votesToNext + ")" : ""}</caption></table>`;
+
+  // per-pair table (least-settled first)
+  html += `<table><caption>pairs (least-settled first)</caption>`;
+  html += "<tr><th>pair</th><th>games</th><th>W–L</th><th>leader</th><th>state</th></tr>";
   for (const r of snap.rows) {
     const cls = [];
     if (r.isTie) cls.push("is-tie");
-    if (r.gate < 1) cls.push("low-gate");
+    if (r.unsettled) cls.push("low-gate");
     html += `<tr class="${cls.join(" ")}">` +
             `<td>${escapeHtml(debugName(r.a))} vs ${escapeHtml(debugName(r.b))}</td>` +
             `<td>${r.games}</td><td>${r.winsA}–${r.winsB}</td>` +
-            `<td>${f3(r.z)}</td><td>${f3(r.sep)}</td><td>${r.gate.toFixed(2)}</td>` +
-            `<td>${f3(r.resolved)}</td></tr>`;
+            `<td>${escapeHtml(debugName(r.leader))}</td><td>${r.state}</td></tr>`;
   }
   html += "</table>";
   body.innerHTML = html;
@@ -1270,68 +1307,53 @@ async function copyDebugDiagnostic() {
     log("vote keys with NO matching item (silently dropped votes):", missing.length ? JSON.stringify(missing) : "none");
   }
 
-  // replay from scratch to get per-vote precision + rejections.
-  // IMPORTANT: the vote log stores keys as "folder::filename" (see makeItem), NOT
-  // raw filenames. Build the replay core from the actual keys in the log so the
-  // replay matches the live engine; using state.files (bare names) would reject
-  // every vote. Fall back to folder::file if the log is somehow empty.
+  // Replay from scratch into a fresh core to verify the live ranking + report
+  // the final state. The vote log stores keys as "folder::filename" (see
+  // makeItem), so build the replay core from the keys IN the log; fall back to
+  // folder::file if the log is empty.
   if (Core && state && state.files) {
     const logKeys = Array.from(new Set(voteLog.flatMap(v => [v.a, v.b])));
     const replayKeys = logKeys.length
       ? logKeys
       : state.files.map(fn => folder + "::" + fn);
-    const mkCore = () => new Core(replayKeys.slice());
-    const core = mkCore();
-    const series = [];
+    const core = new Core(replayKeys.slice());
     let rejected = 0;
-    for (let i = 0; i < voteLog.length; i++) {
-      const v = voteLog[i];
-      const before = core.precision();
-      const accepted = core.vote(v.a, v.b, v.winner);
-      if (!accepted) rejected++;
-      series.push({ i, v, before, after: core.precision(), accepted });
-    }
+    for (const v of voteLog) if (!core.vote(v.a, v.b, v.winner)) rejected++;
     log("votes rejected on replay (bad keys):", rejected);
-    log("final precision:", core.precision().toFixed(4));
-    log("final ranking:", core.ranking().map(r => debugName(r.key) + ":" + Math.round(r.r)).join("  "));
 
-    log("\n=== PER-VOTE PRECISION ===");
-    for (const e of series) {
-      const loser = e.v.winner === e.v.a ? e.v.b : e.v.a;
-      const d = e.after - e.before;
-      log(`${String(e.i).padStart(3)} | ${debugName(e.v.winner)} > ${debugName(loser)} | ` +
-          `${e.before.toFixed(3)} -> ${e.after.toFixed(3)} | ${d >= 0 ? "+" : ""}${d.toFixed(3)}` +
-          (e.accepted ? "" : "  <<< REJECTED"));
+    const s = core.status();
+    log("bar fill:", (100 * s.fill).toFixed(0) + "%", "| phase:", s.phase,
+        "| tier:", s.tier, "| competence:", (100 * s.competence).toFixed(0) + "%");
+    log("complete:", s.complete, "| winner locked:", s.winnerLocked,
+        s.winnerLocked ? "| winner(s): " + s.winners.map(debugName).join(", ") : "");
+    log("next:", s.nextLabel, s.votesToNext ? "(~" + s.votesToNext + " votes)" : "");
+
+    log("\n=== FINAL RANKING (clusters) ===");
+    for (const r of core.ranking()) {
+      log(`${String(r.rank).padStart(2)}. ${debugName(r.key).padEnd(28)} score=${r.score}` +
+          ` decided ${r.wins}-${r.losses}${r.tied ? "  ≈ tied" : ""}`);
     }
 
-    // worst drop + per-pair breakdown before/after
-    const drops = series.map(e => ({ ...e, d: e.after - e.before }))
-                        .filter(e => e.d < -0.02).sort((a, b) => a.d - b.d);
-    log("\n=== BIGGEST DROPS (delta < -0.02) ===");
-    if (!drops.length) log("(none)");
-    for (const e of drops) {
-      const loser = e.v.winner === e.v.a ? e.v.b : e.v.a;
-      log(`vote #${e.i}: ${debugName(e.v.winner)} > ${debugName(loser)} | ${e.before.toFixed(3)} -> ${e.after.toFixed(3)} (${e.d.toFixed(3)})`);
+    log("\n=== PER-PAIR HEAD-TO-HEAD ===");
+    log("pair | games | W-L | leader | state");
+    const order = { unseen: 0, provisional: 1, tied: 2, decided: 3 };
+    const prs = [];
+    for (let i = 0; i < core.n; i++) for (let j = i + 1; j < core.n; j++) prs.push(core.pairState(i, j));
+    prs.sort((a, b) => (order[a.state] - order[b.state]) || (a.games - b.games));
+    for (const ps of prs) {
+      log(`${debugName(core.keys[ps.i])} vs ${debugName(core.keys[ps.j])} | ${ps.games} | ` +
+          `${ps.wins}-${ps.loss} | ${ps.leader == null ? "—" : debugName(core.keys[ps.leader])} | ${ps.state}`);
     }
-    if (drops.length) {
-      const worst = drops[0];
-      const replayTo = (k) => { const cc = mkCore(); for (let i = 0; i < k; i++) cc.vote(voteLog[i].a, voteLog[i].b, voteLog[i].winner); return cc; };
-      const dump = (cc, label) => {
-        log(`--- ${label} (precision ${cc.precision().toFixed(4)}) ---`);
-        log("pair | games | W-L | z | sep | gate | resolved");
-        for (let i = 0; i < cc.n; i++) for (let j = i + 1; j < cc.n; j++) {
-          const a = { theta: cc.theta[i], se: cc.se[i] }, b = { theta: cc.theta[j], se: cc.se[j] };
-          const z = Math.abs(Core.sepZ(a, b));
-          const sep = Math.max(0, Math.min(1, z / Core.SEP_Z));
-          const gate = Math.min(1, cc.games[i][j] / Core.MIN_DIRECT);
-          const resolved = gate * Math.max(sep, gate * (1 - sep));
-          log(`${debugName(cc.keys[i])} vs ${debugName(cc.keys[j])} | ${cc.games[i][j]} | ${cc.wins[i][j]}-${cc.wins[j][i]} | ${z.toFixed(3)} | ${sep.toFixed(3)} | ${gate.toFixed(2)} | ${resolved.toFixed(3)}`);
-        }
-      };
-      log(`\n=== PER-PAIR BREAKDOWN around worst drop (vote #${worst.i}) ===`);
-      dump(replayTo(worst.i), "BEFORE");
-      dump(replayTo(worst.i + 1), "AFTER");
+
+    // sanity: no ranking should contradict a DECIDED head-to-head
+    const pos = {}; core.ranking().forEach((r, i) => pos[r.key] = i);
+    let inversions = 0;
+    for (const ps of prs) {
+      if (ps.state !== "decided") continue;
+      const hi = core.keys[ps.leader], lo = core.keys[ps.leader === ps.i ? ps.j : ps.i];
+      if (pos[hi] > pos[lo]) { inversions++; log(`  ⚠ INVERSION: ${debugName(lo)} ranked above ${debugName(hi)} (H2H ${ps.wins}-${ps.loss})`); }
     }
+    log("decided-H2H inversions:", inversions, inversions ? "⚠" : "✓");
   }
 
   // win/games tally
@@ -1437,10 +1459,21 @@ function showResults(items, opts) {
   els.headerSub.textContent = currentFolder + (isRanked ? " — ranked!" : "");
   els.resultsLanes.innerHTML = "";
 
-  // headings + which share button is relevant for this mode
-  document.getElementById("resultsHeading").textContent = isRanked ? "Final ranking" : "Listen & compare";
+  // headings + which share button is relevant for this mode. When we have score
+  // data, announce the winner (or co-winners) right in the heading.
+  const scoreMap = (opts && opts.scores) || null;
+  let heading = isRanked ? "Final ranking" : "Listen & compare";
+  if (isRanked && scoreMap) {
+    const winners = items.filter(it => scoreMap[it.file] && scoreMap[it.file].rank === 1);
+    if (winners.length === 1) {
+      heading = "🏆 " + (winners[0].name || winners[0].file.replace(/\.[^.]+$/, ""));
+    } else if (winners.length > 1) {
+      heading = "🏆 Tied: " + winners.map(w => w.name || w.file.replace(/\.[^.]+$/, "")).join(" & ");
+    }
+  }
+  document.getElementById("resultsHeading").textContent = heading;
   document.getElementById("resultsBlurb").textContent = isRanked
-    ? "Your ranking, best at the top. Click any track to hear it, or click a waveform to jump to a spot."
+    ? "Your ranking, best at the top. Tracks marked “≈ tied” you preferred about equally. Click any track to hear it, or a waveform to jump."
     : "All tracks in this set. Click any track to hear it, or click a waveform to jump to a spot.";
   // From a ranked view this re-enters the vote loop WITHOUT wiping — so you can
   // keep voting to tighten confidence. From a no-ranking listening view it just
@@ -1448,39 +1481,35 @@ function showResults(items, opts) {
   const startOverBtn = document.getElementById("resultsStartOver");
   startOverBtn.textContent = isRanked ? "➕ Keep refining" : "▶ Take the test";
 
-  // Scores let us show how far apart tracks are and flag statistical ties — two
-  // adjacent tracks whose rating±interval overlap aren't really distinguishable.
+  // Scores carry the head-to-head ranking info per file: cluster `rank` (shared
+  // by tied items), net matchup `score`, decided W–L, and a `tied` flag. Items
+  // arrive already in ranked order, so a tie cluster is a run of equal `rank`.
   const scores = (opts && opts.scores) || null;
-  const tiedWithNext = items.map((item, i) => {
-    if (!isRanked || !scores || i >= items.length - 1) return false;
-    const a = scores[item.file], b = scores[items[i + 1].file];
-    if (!a || !b) return false;
-    // same z-test the precision bar uses: not separated at ~95% one-sided → tied
-    return PreferenceRater.sepZ(a, b) < PreferenceRater.SEP_Z;
-  });
 
   const colors = shuffled(PALETTE); // random rank→color mapping each run
   items.forEach((item, i) => {
     const color = colors[i % colors.length];
-    const rankCls = isRanked ? (i === 0 ? "top1" : i === 1 ? "top2" : i === 2 ? "top3" : "") : "";
+    const sc = scores && scores[item.file];
+    const rank = sc && sc.rank != null ? sc.rank : (i + 1);
+    // medal class follows the CLUSTER rank, so co-winners both get gold etc.
+    const rankCls = isRanked ? (rank === 1 ? "top1" : rank === 2 ? "top2" : rank === 3 ? "top3" : "") : "";
     const realName = item.file.replace(/\.[^.]+$/, ""); // real filename, sans extension
 
-    // score readout under the rank number; tie note next to the name when this
-    // track and the one below it are statistically indistinguishable.
-    const sc = scores && scores[item.file];
+    // score readout: net matchups won (decided record) under the rank pill.
     const scoreHTML = (isRanked && sc)
-      ? `<span class="score">${Math.round(sc.r)}<span class="score-pm">±${Math.round(PreferenceRater.Z * sc.rd)}</span></span>`
+      ? `<span class="score" title="net matchups won">${sc.wins}–${sc.losses}</span>`
       : "";
-    const tieNote = (tiedWithNext[i] || tiedWithNext[i - 1])
-      ? ` <span class="tie-note" title="ratings overlap within the margin of error">≈ tied</span>` : "";
+    // tie note when this track shares its cluster rank with a neighbor.
+    const tieNote = (isRanked && sc && sc.tied)
+      ? ` <span class="tie-note" title="you preferred these about equally">≈ tied</span>` : "";
 
     const lane = buildLane({
       key: item.key,
       url: item.url,
       color,
       extraClass: "ranked " + rankCls,
-      // ranked view shows the position number + score; listening view shows just the radio dot
-      headHTML: isRanked ? `<span class="rank-pill">${i + 1}</span>` : "",
+      // ranked view shows the CLUSTER rank (tied tracks share a number); listening shows just the dot
+      headHTML: isRanked ? `<span class="rank-pill">${rank}</span>` : "",
       sideHTML: scoreHTML,
       topHTML: `<span class="nm">${escapeHtml(realName)}${tieNote}</span>`,  // name above the waveform
     });
