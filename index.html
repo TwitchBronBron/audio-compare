@@ -84,6 +84,27 @@
   }
   .progress-fill { height: 100%; background: var(--accent); width: 0%; transition: width .25s; }
 
+  /* precision bar: taller, with good/better/best threshold markers like MKBHD's.
+     Markers sit at 33% / 66% / 100% and "light up" once the fill passes them. */
+  .progress-bar.precision { height: 10px; border-radius: 5px; position: relative; overflow: visible; }
+  .progress-bar.precision .progress-fill {
+    border-radius: 5px;
+    background: linear-gradient(90deg, var(--accent), var(--wave-b));
+  }
+  .progress-bar.precision .mark {
+    position: absolute; top: 50%; width: 12px; height: 12px; border-radius: 50%;
+    transform: translate(-50%, -50%); background: var(--panel);
+    border: 2px solid var(--border); transition: border-color .25s, background .25s;
+  }
+  .progress-bar.precision .m-good   { left: 33.33%; }
+  .progress-bar.precision .m-better { left: 66.66%; }
+  .progress-bar.precision .m-best   { left: 100%; }
+  .progress-bar.precision.lit-good   .m-good,
+  .progress-bar.precision.lit-better .m-better,
+  .progress-bar.precision.lit-best   .m-best {
+    background: var(--wave-b); border-color: var(--wave-b);
+  }
+
   /* DAW-style stacked lanes — one playhead sweeps across all in parallel.
      Lanes are separated by a gap so each track reads as its own block. */
   .vs-wrap { display: flex; flex-direction: column; gap: 8px; }
@@ -150,9 +171,19 @@
   .lane.active-audio .wave-label { background: color-mix(in srgb, var(--c) 16%, var(--panel-2)); }
   .lane.active-audio .wave-label .nm { color: var(--c); }
 
-  /* results: left column only holds radio + number, so it can be narrow */
-  .lane.ranked { grid-template-columns: 44px 56px 1fr; }
-  .lane.ranked .lane-side { justify-content: center; align-items: center; padding: 0; }
+  /* results: left column holds radio + number + score, so give it a bit of room */
+  .lane.ranked { grid-template-columns: 44px 66px 1fr; }
+  .lane.ranked .lane-side { justify-content: center; align-items: center; padding: 4px 0; gap: 3px; }
+  .lane.ranked .lane-head { justify-content: center; }
+
+  /* rating readout under the rank pill on the results screen */
+  .score { font-size: 13px; font-weight: 700; font-variant-numeric: tabular-nums; color: var(--text); }
+  .score-pm { font-size: 10px; font-weight: 600; color: var(--muted); margin-left: 1px; }
+  .tie-note {
+    font-size: 11px; font-weight: 700; color: var(--accent-2);
+    border: 1px solid var(--accent-2); border-radius: 5px; padding: 0 5px; margin-left: 6px;
+    vertical-align: middle; white-space: nowrap;
+  }
 
   /* shared transport bar under the lanes */
   .transport {
@@ -194,7 +225,7 @@
 
     /* keep lanes horizontal (A/B labels are tiny) — just tighten the columns */
     .lane { grid-template-columns: 34px 44px 1fr; }
-    .lane.ranked { grid-template-columns: 34px 44px 1fr; }
+    .lane.ranked { grid-template-columns: 34px 56px 1fr; }
     .lane-radio { border-right: none; }
     .radio-dot { width: 16px; height: 16px; }
     .lane-side { padding: 8px 4px; gap: 4px; }
@@ -250,8 +281,13 @@
         <strong id="compareTitle"></strong>
         <span class="muted" id="compareCount"></span>
       </div>
-      <div class="progress-bar"><div class="progress-fill" id="progressFill"></div></div>
-      <p class="muted" style="margin-top:0">Press play, then click between A and B to A/B them at the same spot. Click anywhere on a waveform to jump there. When you've decided, pick the one you prefer.</p>
+      <div class="progress-bar precision">
+        <div class="progress-fill" id="progressFill"></div>
+        <span class="mark m-good"  title="good"></span>
+        <span class="mark m-better" title="better"></span>
+        <span class="mark m-best"  title="best"></span>
+      </div>
+      <p class="muted" style="margin-top:0">Press play, then click between A and B to A/B them at the same spot. Click anywhere on a waveform to jump there. When you've decided, pick the one you prefer. The bar fills as your ranking becomes statistically settled — vote as many times as you like, then hit <strong>Show my ranking</strong>.</p>
 
       <div class="vs-wrap" id="vsWrap"></div>
 
@@ -266,6 +302,10 @@
       </div>
 
       <div class="pick-row" id="pickRow"></div>
+
+      <div class="toolbar center" style="justify-content:center;margin-top:16px;">
+        <button class="primary" id="finishRanking">✓ Show my ranking</button>
+      </div>
 
       <div class="toolbar center" style="justify-content:center;margin-top:18px;">
         <button class="ghost" id="shareTest">🔗 Copy test link</button>
@@ -351,15 +391,17 @@ async function listDir(url) {
 
 /* ------------------------------------------------------------------ *
  * Persistence — per-folder progress saved to localStorage so a refresh
- * resumes exactly where you left off. We store the (randomized) item order,
- * every recorded choice, and the final ranking once complete.
- *   state = { order: [filename...], choices: { "<keyA>|<keyB>": winnerKey },
+ * resumes exactly where you left off. The rating model is noise-tolerant, so we
+ * store the FULL vote log (every comparison, repeats included — that's the whole
+ * point: repeated votes build statistical confidence). Ratings are recomputed by
+ * replaying the log, so the log is the single source of truth.
+ *   state = { files: [filename...],            // membership check
+ *             votes: [{ a:key, b:key, winner:key }, ...],
  *             done: bool, ranking: [filename...] }
- * Choices are keyed by the unordered pair so replay is order-independent.
+ * Storage key is v2 — the old v1 merge-sort data is intentionally not migrated.
  * ------------------------------------------------------------------ */
 const Store = {
-  KEY: (folder) => "audiocompare:v1:" + folder,
-  pairKey: (k1, k2) => [k1, k2].sort().join("|"),
+  KEY: (folder) => "audiocompare:v2:" + folder,
 
   load(folder) {
     try { return JSON.parse(localStorage.getItem(this.KEY(folder))) || null; }
@@ -640,68 +682,249 @@ function setupWaveform(track, canvas, color, getKey) {
 }
 
 /* ------------------------------------------------------------------ *
- * Comparison-driven merge sort (binary outcomes, full ranking)
- * ------------------------------------------------------------------ */
-class ComparisonSorter {
+ * Bradley–Terry preference rating (noise-tolerant, single voter)
+ * ------------------------------------------------------------------ *
+ *
+ * Instead of a brittle merge sort (each pair compared once, cached forever,
+ * total order assumed), we fit a Bradley–Terry model to the FULL vote history
+ * after every vote. BT is the statistical model behind Elo/Glicko — but since
+ * we have only 3–8 items and store every vote, we fit the real model directly
+ * rather than the online RD-decay approximation Glicko uses for chess
+ * populations (that approximation has a sticky uncertainty floor that, at this
+ * scale, made the confidence bar effectively never move — that was the bug).
+ *
+ * Each item i has a latent strength θ_i (log scale). The model says
+ *   P(i beats j) = 1 / (1 + e^-(θ_i - θ_j)).
+ * We find the θ that maximize the likelihood of your votes via the standard MM
+ * (minorization–maximization) iteration — a few dozen cheap iterations.
+ *
+ * UNCERTAINTY comes straight from the data: an item's standard error shrinks as
+ * you vote on it more and as your votes are more consistent. Flip-flop on a pair
+ * and their strengths sit near-equal with wide overlapping error bars — exactly
+ * the "you don't really have a preference here" signal. No RD schedule, no floor.
+ *
+ * Significance of "A ranks above B" = z-score on the strength difference,
+ * (θA-θB)/SE_diff. The precision bar blends average pairwise separation with
+ * total evidence so every consistent vote visibly moves it (smooth progress),
+ * reaching 100% only when the whole ordering is solidly separated.
+ *
+ * Matchups are chosen semi-randomly, weighted toward close + under-sampled
+ * pairs. Sampling is unbiased — which pairs you see affects only how FAST
+ * confidence grows, never the ranking — so randomness costs nothing but variety.
+ */
+
+class PreferenceRater {
   constructor(items) {
-    this.items = items;            // [{file, name, key, url}]
-    this.pending = null;           // {a, b, resolve}
-    this.totalComparisons = 0;
-    this.doneComparisons = 0;
-    this._estimateTotal();
+    this.items = items;             // [{file, name, key, url}]
+    this.keys = items.map(it => it.key);
+    this.idx = new Map(this.keys.map((k, i) => [k, i]));
+    this.n = items.length;
+    this.pending = null;            // {a, b}
+    this.voteCount = 0;
+
+    // wins[i][j] = number of times item i was preferred over item j
+    this.wins = Array.from({ length: this.n }, () => new Array(this.n).fill(0));
+    // games[i][j] = total comparisons between i and j (symmetric)
+    this.games = Array.from({ length: this.n }, () => new Array(this.n).fill(0));
+
+    // fitted strengths (log scale) + standard errors, recomputed after each vote
+    this.theta = new Array(this.n).fill(0);
+    this.se = new Array(this.n).fill(Infinity);
+
+    this._resolveDone = null;
+    this._running = false;
   }
-  _estimateTotal() {
-    // Exact worst-case comparison count for THIS list, computed by walking the
-    // same split structure the sort uses and summing (left+right-1) per merge.
-    // (Actual runs can be fewer when one side of a merge empties early.)
-    const worst = (len) => {
-      if (len <= 1) return 0;
-      const mid = Math.floor(len / 2);
-      return worst(mid) + worst(len - mid) + (len - 1);
-    };
-    this.estTotal = worst(this.items.length);
+
+  // We report strengths on a familiar Elo-ish scale for display: rating = 1500 +
+  // SCALE·θ. Purely cosmetic; all significance math is done on θ directly.
+  static get SCALE() { return 400 / Math.LN10; }  // matches Elo's 400/ln10 slope
+  static get Z() { return 1.96; }                 // ±95% display interval
+  static get SEP_Z() { return 1.64; }             // one-sided ~95% "separated" threshold
+
+  // significance of A over B as a z-score on the strength difference
+  static sepZ(a, b) {
+    // accepts either a fitted row {theta, se} or a saved snapshot {r, rd}
+    const ta = a.theta != null ? a.theta : (a.r - 1500) / PreferenceRater.SCALE;
+    const tb = b.theta != null ? b.theta : (b.r - 1500) / PreferenceRater.SCALE;
+    const sea = a.se != null ? a.se : (a.rd / PreferenceRater.Z) / PreferenceRater.SCALE;
+    const seb = b.se != null ? b.se : (b.rd / PreferenceRater.Z) / PreferenceRater.SCALE;
+    const sd = Math.sqrt(sea * sea + seb * seb) || 1e-9;
+    return (ta - tb) / sd;
   }
-  // ask user to compare a pair. If we have a recorded answer (from a previous
-  // session), replay it silently; otherwise prompt the user and record it.
-  _ask(a, b) {
-    const recorded = this.recall ? this.recall(a.key, b.key) : null;
-    if (recorded === a.key || recorded === b.key) {
-      this.doneComparisons++;
-      return Promise.resolve(recorded === a.key ? a : b);
+
+  _record(iWin, iLose) {
+    this.wins[iWin][iLose]++;
+    this.games[iWin][iLose]++;
+    this.games[iLose][iWin]++;
+    this.voteCount++;
+  }
+
+  // load a prior vote log (array of {a, b, winner}) into the win/games matrices
+  replay(log) {
+    for (const v of log) {
+      const wi = this.idx.get(v.winner);
+      const oi = this.idx.get(v.winner === v.a ? v.b : v.a);
+      if (wi == null || oi == null) continue;
+      this._record(wi, oi);
     }
+    this._fit();
+  }
+
+  // ---- Bradley–Terry MLE via MM iteration ----------------------------------
+  // Add a tiny symmetric pseudo-count (a Bayesian prior) so the fit is always
+  // defined — even before any votes, or for an item that has only ever won/lost.
+  // The prior also keeps SEs finite and is what makes the bar start near 0 and
+  // climb smoothly rather than being undefined then snapping.
+  _fit() {
+    const n = this.n, PRIOR = 0.5;
+    // effective win/game counts including the prior (acts like half a win + half
+    // a loss against a phantom average opponent for every pair)
+    const W = [], N = [];
+    for (let i = 0; i < n; i++) {
+      W[i] = 0;
+      N[i] = [];
+      for (let j = 0; j < n; j++) {
+        N[i][j] = i === j ? 0 : this.games[i][j] + 2 * PRIOR;
+        if (i !== j) W[i] += this.wins[i][j] + PRIOR;
+      }
+    }
+
+    // strengths p_i = e^θ_i ; iterate MM updates, then renormalize (geometric mean = 1)
+    let p = new Array(n).fill(1);
+    for (let iter = 0; iter < 200; iter++) {
+      const np = new Array(n).fill(0);
+      for (let i = 0; i < n; i++) {
+        let denom = 0;
+        for (let j = 0; j < n; j++) {
+          if (i === j) continue;
+          denom += N[i][j] / (p[i] + p[j]);
+        }
+        np[i] = denom > 0 ? W[i] / denom : p[i];
+      }
+      // normalize to geometric mean 1 to keep things stable
+      let logsum = 0;
+      for (let i = 0; i < n; i++) logsum += Math.log(np[i]);
+      const gm = Math.exp(logsum / n);
+      let maxRel = 0;
+      for (let i = 0; i < n; i++) {
+        np[i] /= gm;
+        maxRel = Math.max(maxRel, Math.abs(np[i] - p[i]) / (p[i] || 1));
+      }
+      p = np;
+      if (maxRel < 1e-9) break;
+    }
+
+    this.theta = p.map(v => Math.log(v));
+
+    // ---- standard errors from the Fisher information --------------------------
+    // For BT, the observed information for θ_i (with others fixed) is
+    //   I_ii = Σ_j N_ij · P_ij · (1 - P_ij),  where P_ij = p_i/(p_i+p_j).
+    // SE_i ≈ 1/√I_ii. This shrinks as you play i more (bigger N) and is largest
+    // for near-50/50 (P≈0.5) opponents — i.e. uncertainty tracks evidence directly.
+    for (let i = 0; i < n; i++) {
+      let info = 0;
+      for (let j = 0; j < n; j++) {
+        if (i === j) continue;
+        const Pij = p[i] / (p[i] + p[j]);
+        info += N[i][j] * Pij * (1 - Pij);
+      }
+      this.se[i] = info > 0 ? 1 / Math.sqrt(info) : Infinity;
+    }
+  }
+
+  // current ranking, best first, with display rating + interval bounds
+  ranking() {
+    return this.items
+      .map((it, k) => {
+        const i = this.idx.get(it.key);
+        const r = 1500 + PreferenceRater.SCALE * this.theta[i];
+        const rd = PreferenceRater.Z * PreferenceRater.SCALE * (isFinite(this.se[i]) ? this.se[i] : 3);
+        return { item: it, theta: this.theta[i], se: this.se[i], r, rd, lo: r - rd, hi: r + rd };
+      })
+      .sort((x, y) => y.theta - x.theta);
+  }
+
+  // Smooth precision in [0,1]: every adjacent pair contributes how far its
+  // separation z-score has progressed toward the SEP_Z threshold (capped at 1),
+  // averaged across the ranking. So partial progress on every pair shows up, and
+  // the bar only reaches 100% when ALL neighbors are fully separated.
+  precision() {
+    const rk = this.ranking();
+    if (rk.length < 2) return 1;
+    let sum = 0;
+    for (let i = 0; i < rk.length - 1; i++) {
+      const z = PreferenceRater.sepZ(rk[i], rk[i + 1]);
+      sum += Math.max(0, Math.min(1, z / PreferenceRater.SEP_Z));
+    }
+    return sum / (rk.length - 1);
+  }
+
+  // Semi-random next matchup. Build a weight for every pair that favors pairs
+  // that are (a) statistically close and (b) under-sampled, then sample one pair
+  // at random in proportion to weight. Real randomness → good variety; the
+  // weighting → still spends extra attention where confidence is low.
+  nextPair() {
+    const rk = this.ranking();                 // sorted; lets us bias toward adjacency
+    const pos = new Map(rk.map((row, r) => [row.item.key, r]));
+    const pairs = [];
+    let total = 0;
+    for (let i = 0; i < this.n; i++) {
+      for (let j = i + 1; j < this.n; j++) {
+        const ki = this.keys[i], kj = this.keys[j];
+        const g = this.games[i][j];
+        // closeness: how far this pair still is from being resolved (1 = totally
+        // unresolved, →0 as it separates). Built from the same z-score.
+        const a = rk[pos.get(ki)], b = rk[pos.get(kj)];
+        const z = Math.abs(PreferenceRater.sepZ(a, b));
+        const closeness = Math.max(0.05, 1 - Math.min(1, z / PreferenceRater.SEP_Z));
+        // under-sampling: fewer prior games → higher weight
+        const undersampled = 1 / (1 + g);
+        // adjacency bonus: neighbors in the current order are most informative
+        const adjacency = 1 / (1 + Math.abs(pos.get(ki) - pos.get(kj)));
+        // blend, then keep a floor of randomness so ANY pair can come up
+        const w = 0.15 + closeness * 1.0 + undersampled * 1.0 + adjacency * 0.5;
+        pairs.push({ i, j, w });
+        total += w;
+      }
+    }
+    // weighted random draw
+    let pick = pairs[0];
+    let roll = Math.random() * total;
+    for (const pr of pairs) { roll -= pr.w; if (roll <= 0) { pick = pr; break; } }
+    const itA = this.items[pick.i], itB = this.items[pick.j];
+    // randomize which side is shown as A vs B so position carries no signal
+    return Math.random() < 0.5 ? [itA, itB] : [itB, itA];
+  }
+
+  run() {
+    this._running = true;
     return new Promise((resolve) => {
-      this.pending = { a, b, resolve };
-      renderComparison(a, b, (winner) => {
-        this.doneComparisons++;
-        if (this.record) this.record(a.key, b.key, winner.key);
-        const p = this.pending;
-        this.pending = null;
-        p.resolve(winner);
-      });
+      this._resolveDone = resolve;
+      this._serveNext();
     });
   }
-  async sort() {
-    const result = await this._mergeSort(this.items.slice());
-    return result; // best first
+
+  finish() {
+    if (!this._running) return;
+    this._running = false;
+    const done = this._resolveDone;
+    this._resolveDone = null;
+    if (done) done(this.ranking().map(rk => rk.item));
   }
-  async _mergeSort(arr) {
-    if (arr.length <= 1) return arr;
-    const mid = Math.floor(arr.length / 2);
-    const left = await this._mergeSort(arr.slice(0, mid));
-    const right = await this._mergeSort(arr.slice(mid));
-    return this._merge(left, right);
-  }
-  async _merge(left, right) {
-    const out = [];
-    let i = 0, j = 0;
-    while (i < left.length && j < right.length) {
-      const winner = await this._ask(left[i], right[j]); // "preferred" = ranked higher
-      if (winner === left[i]) out.push(left[i++]);
-      else out.push(right[j++]);
-    }
-    while (i < left.length) out.push(left[i++]);
-    while (j < right.length) out.push(right[j++]);
-    return out;
+
+  _serveNext() {
+    if (!this._running) return;
+    const [a, b] = this.nextPair();
+    this.pending = { a, b };
+    renderComparison(a, b, (winner) => {
+      const wi = this.idx.get(winner.key);
+      const oi = this.idx.get(winner === a ? b.key : a.key);
+      this._record(wi, oi);
+      this._fit();
+      if (this.record) this.record(a.key, b.key, winner.key);
+      this.pending = null;
+      if (this._running) this._serveNext();
+    });
   }
 }
 
@@ -736,15 +959,23 @@ const ICON_PAUSE = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 5h4v
 // Keeps the transport readout + play button + lane state in sync with the engine.
 // Defined here (not inside renderComparison) because the Engine references it.
 // Works for whichever screen owns the current lanes (compare or results).
+// Tracks the last icon written to each transport button so we only rewrite
+// innerHTML when it actually changes. Rewriting the <svg> every animation frame
+// (as this used to) destroys and rebuilds the element under the pointer, which
+// can swallow a click — that was the "pause stops responding" bug.
+let _lastTransportIcon = null;
 function onTransportTick() {
   const cur = fmtTime(Engine.sharedPos), dur = fmtTime(Engine.duration());
   const icon = Engine.playing ? ICON_PAUSE : ICON_PLAY;
   if (els.tCur) els.tCur.textContent = cur;
   if (els.tDur) els.tDur.textContent = dur;
-  if (els.transportPlay) els.transportPlay.innerHTML = icon;
   if (els.rCur) els.rCur.textContent = cur;
   if (els.rDur) els.rDur.textContent = dur;
-  if (els.resultsPlay) els.resultsPlay.innerHTML = icon;
+  if (icon !== _lastTransportIcon) {
+    if (els.transportPlay) els.transportPlay.innerHTML = icon;
+    if (els.resultsPlay) els.resultsPlay.innerHTML = icon;
+    _lastTransportIcon = icon;
+  }
 
   for (const lane of document.querySelectorAll(".lane")) {
     const active = lane.dataset.key === Engine.activeKey;
@@ -753,7 +984,7 @@ function onTransportTick() {
   }
 }
 let currentFolder = null;
-let sorter = null;
+let rater = null;
 
 function show(step) {
   els.stepSelect.classList.toggle("hidden", step !== "select");
@@ -776,7 +1007,7 @@ function refreshFolderList() {
     const state = Store.load(name);
     let status = "";
     if (state && state.done) status = "✓ ranked — view results";
-    else if (state && state.choices && Object.keys(state.choices).length) status = "in progress — resume";
+    else if (state && state.votes && state.votes.length) status = "in progress — resume";
 
     const btn = document.createElement("button");
     btn.className = "folder-btn";
@@ -873,42 +1104,52 @@ async function startSet(folder, opts) {
       return;
     }
 
-    // Load saved progress. Reuse the stored order if it still matches the
-    // folder's files; otherwise start fresh with a new randomized order.
+    // Load saved progress. Keep the saved vote log if it's for the same set of
+    // files; otherwise start fresh. (Vote keys are folder::filename, so a changed
+    // file list means the old log can't be trusted.)
     let state = Store.load(folder);
-    const sameFiles = state && state.order && state.order.length === files.length &&
-      state.order.slice().sort().join("|") === files.slice().sort().join("|");
+    const sameFiles = state && state.files && state.files.length === files.length &&
+      state.files.slice().sort().join("|") === files.slice().sort().join("|");
     if (!sameFiles) {
-      state = { order: shuffled(files), choices: {}, done: false, ranking: null };
+      state = { files: files.slice(), votes: [], done: false, ranking: null };
       Store.save(folder, state);
     }
 
     els.compareTitle.textContent = folder;
     els.headerSub.textContent = folder;
 
-    // Already finished? Jump straight to results (rebuild from saved ranking).
-    if (state.done && state.ranking) {
+    // Finished AND the user hasn't asked to keep refining? Show results. (We still
+    // let them re-enter the compare loop to build more confidence — see below.)
+    if (state.done && state.ranking && !(opts && opts.refine)) {
       const ranked = state.ranking.map(fn => makeItem(folder, fn));
-      showResults(ranked);
+      showResults(ranked, { scores: state.scores });
       return;
     }
 
-    const items = state.order.map(fn => makeItem(folder, fn));
-    sorter = new ComparisonSorter(items);
-    // wire persistence: replay saved choices, record new ones
-    sorter.recall = (kA, kB) => state.choices[Store.pairKey(kA, kB)] || null;
-    sorter.record = (kA, kB, winner) => {
-      state.choices[Store.pairKey(kA, kB)] = winner;
+    const items = files.map(fn => makeItem(folder, fn));
+    rater = new PreferenceRater(items);
+    rater.replay(state.votes || []);     // rebuild ratings from the saved log
+    state.done = false;                  // re-entering the loop reopens the set
+    // record each new vote into the log and persist immediately
+    rater.record = (kA, kB, winner) => {
+      state.votes.push({ a: kA, b: kB, winner });
       Store.save(folder, state);
     };
 
     show("compare");
     syncUrl(folder, "compare");
-    const ranked = await sorter.sort();
+    const ranked = await rater.run();    // resolves when the user clicks "Done"
     state.done = true;
     state.ranking = ranked.map(it => it.file);
+    // snapshot the rating + interval per file so the results screen can show how
+    // far apart tracks are (and flag statistical ties) even after a reload.
+    const rk = rater.ranking();
+    state.scores = {};
+    for (const row of rk) {
+      state.scores[row.item.file] = { r: row.r, rd: row.rd, lo: row.lo, hi: row.hi };
+    }
     Store.save(folder, state);
-    showResults(ranked);
+    showResults(ranked, { scores: state.scores });
   } catch (e) {
     show("select");
     els.selectErr.textContent = "Couldn't load \"" + folder + "\": " + e.message;
@@ -971,12 +1212,33 @@ function buildLane(opts) {
   return lane;
 }
 
+// Map a precision fraction (0..1) to a tier label, MKBHD-style good/better/best.
+function precisionTier(p) {
+  if (p >= 1)    return "best — every track is statistically separated";
+  if (p >= 0.66) return "better — almost there, a few close calls left";
+  if (p >= 0.33) return "good — you can stop here, or keep going for more confidence";
+  return "building confidence — keep voting";
+}
+
+// Update the precision bar + readout from the rater's current state.
+function updatePrecision() {
+  if (!rater) return;
+  const p = rater.precision();
+  els.progressFill.style.width = Math.round(p * 100) + "%";
+  els.compareCount.textContent =
+    rater.voteCount + " vote" + (rater.voteCount === 1 ? "" : "s") + " · " + precisionTier(p);
+
+  const bar = document.querySelector(".progress-bar.precision");
+  if (bar) {
+    bar.classList.toggle("lit-good",   p >= 0.33);
+    bar.classList.toggle("lit-better", p >= 0.66);
+    bar.classList.toggle("lit-best",   p >= 1);
+  }
+}
+
 // Render one A-vs-B comparison. Names stay secret — lanes show only "A" / "B".
 function renderComparison(a, b, onPick) {
-  const pct = sorter.estTotal ? Math.min(100, Math.round(sorter.doneComparisons / sorter.estTotal * 100)) : 0;
-  els.progressFill.style.width = pct + "%";
-  const n = sorter.doneComparisons + 1;
-  els.compareCount.textContent = "comparison " + n + " of " + Math.max(n, sorter.estTotal);
+  updatePrecision();
 
   Engine.reset();
   els.vsWrap.innerHTML = "";
@@ -1036,23 +1298,47 @@ function showResults(items, opts) {
   document.getElementById("resultsBlurb").textContent = isRanked
     ? "Your ranking, best at the top. Click any track to hear it, or click a waveform to jump to a spot."
     : "All tracks in this set. Click any track to hear it, or click a waveform to jump to a spot.";
-  // "Rank this set again" makes no sense from a no-ranking listening view; offer to take the test instead
+  // From a ranked view this re-enters the vote loop WITHOUT wiping — so you can
+  // keep voting to tighten confidence. From a no-ranking listening view it just
+  // starts the test fresh.
   const startOverBtn = document.getElementById("resultsStartOver");
-  startOverBtn.textContent = isRanked ? "↺ Rank this set again" : "▶ Take the test";
+  startOverBtn.textContent = isRanked ? "➕ Keep refining" : "▶ Take the test";
+
+  // Scores let us show how far apart tracks are and flag statistical ties — two
+  // adjacent tracks whose rating±interval overlap aren't really distinguishable.
+  const scores = (opts && opts.scores) || null;
+  const tiedWithNext = items.map((item, i) => {
+    if (!isRanked || !scores || i >= items.length - 1) return false;
+    const a = scores[item.file], b = scores[items[i + 1].file];
+    if (!a || !b) return false;
+    // same z-test the precision bar uses: not separated at ~95% one-sided → tied
+    return PreferenceRater.sepZ(a, b) < PreferenceRater.SEP_Z;
+  });
 
   const colors = shuffled(PALETTE); // random rank→color mapping each run
   items.forEach((item, i) => {
     const color = colors[i % colors.length];
     const rankCls = isRanked ? (i === 0 ? "top1" : i === 1 ? "top2" : i === 2 ? "top3" : "") : "";
     const realName = item.file.replace(/\.[^.]+$/, ""); // real filename, sans extension
+
+    // score readout under the rank number; tie note next to the name when this
+    // track and the one below it are statistically indistinguishable.
+    const sc = scores && scores[item.file];
+    const scoreHTML = (isRanked && sc)
+      ? `<span class="score">${Math.round(sc.r)}<span class="score-pm">±${Math.round(PreferenceRater.Z * sc.rd)}</span></span>`
+      : "";
+    const tieNote = (tiedWithNext[i] || tiedWithNext[i - 1])
+      ? ` <span class="tie-note" title="ratings overlap within the margin of error">≈ tied</span>` : "";
+
     const lane = buildLane({
       key: item.key,
       url: item.url,
       color,
       extraClass: "ranked " + rankCls,
-      // ranked view shows the position number; listening view shows just the radio dot
+      // ranked view shows the position number + score; listening view shows just the radio dot
       headHTML: isRanked ? `<span class="rank-pill">${i + 1}</span>` : "",
-      topHTML: `<span class="nm">${escapeHtml(realName)}</span>`,  // name above the waveform
+      sideHTML: scoreHTML,
+      topHTML: `<span class="nm">${escapeHtml(realName)}${tieNote}</span>`,  // name above the waveform
     });
     els.resultsLanes.appendChild(lane);
   });
@@ -1090,9 +1376,22 @@ function startOverCurrent() {
   Engine.reset();
   startSet(currentFolder);
 }
+// "Show my ranking" ends the vote loop and computes the final ranking from the
+// ratings as they stand. The user can re-enter later to keep refining (the vote
+// log is preserved), so this is a soft stop, never a lock.
+document.getElementById("finishRanking").addEventListener("click", () => {
+  Engine.pauseAll();
+  if (rater) rater.finish();
+});
 document.getElementById("restartAll").addEventListener("click", startOverCurrent);
 document.getElementById("compareBack").addEventListener("click", goToSelect);
-document.getElementById("resultsStartOver").addEventListener("click", startOverCurrent);
+// "Keep refining" / "Take the test": re-enter the vote loop, preserving the
+// saved vote log so more votes build on existing confidence (no wipe).
+document.getElementById("resultsStartOver").addEventListener("click", () => {
+  if (!currentFolder) return goToSelect();
+  Engine.reset();
+  startSet(currentFolder, { refine: true });
+});
 document.getElementById("resultsRestart").addEventListener("click", goToSelect);
 
 // share-link buttons — grab the right link for the current set
