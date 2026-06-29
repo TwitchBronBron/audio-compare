@@ -299,6 +299,38 @@
   .muted { color: var(--muted); }
   .err { color: #ff6b6b; }
 
+  /* status readout under the bar */
+  .sl-votes { color: var(--text); font-weight: 600; }
+  .sl-ready { color: var(--wave-b); font-weight: 700; }
+  .sl-tier  { color: var(--accent); font-weight: 600; }
+  .sl-dot   { opacity: .5; }
+  .sl-rem   { white-space: nowrap; }
+  .sl-num   { position: relative; font-weight: 700; color: var(--text); }
+  /* the floating -1 / +2 delta bubble that animates on change */
+  .sl-delta {
+    position: absolute; left: 50%; top: -2px;
+    transform: translateX(-50%); font-size: 11px; font-weight: 800;
+    pointer-events: none; white-space: nowrap;
+    animation: slDelta .9s ease-out forwards;
+  }
+  .sl-delta.down { color: #46d39a; }   /* going down = good (closer to done) */
+  .sl-delta.up   { color: var(--accent-2); }
+  @keyframes slDelta {
+    0%   { opacity: 0; transform: translate(-50%, 0); }
+    20%  { opacity: 1; transform: translate(-50%, -10px); }
+    100% { opacity: 0; transform: translate(-50%, -22px); }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .sl-delta { animation: none; opacity: 0; }
+  }
+
+  /* Show-results button: clearly a "results" action once the ranking is ready */
+  #finishRanking.ready {
+    background: #2ea96a; color: #fff;
+  }
+  #finishRanking.ready:hover { background: #34c07a; }
+  #finishRanking:not(.ready) { opacity: .9; }
+
   .toolbar { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 8px; }
 </style>
 </head>
@@ -1064,6 +1096,7 @@ async function startSet(folder, opts) {
 
     const items = files.map(fn => makeItem(folder, fn));
     rater = new PreferenceRater(items);
+    _lastRemaining = null;               // don't flash a delta carried over from another set
     rater.replay(state.votes || []);     // rebuild ratings from the saved log
     state.done = false;                  // re-entering the loop reopens the set
     // record each new vote into the log and persist immediately
@@ -1160,43 +1193,42 @@ const TIER_LABEL = {
   "rock-solid":  "Rock solid",
 };
 
-// Build the line under the bar from the engine's phase/status. Kept SHORT for
-// mobile: a "+N" votes-remaining chip to the next milestone, the winner name
-// once locked, and a brief tier word. No filler.
-//   not complete:   "9 votes · +7 to finish"
-//   phase 1:        "12 votes · +3 to a winner"
-//   phase 2:        "🏆 Mira Bridge · +4 to settle rest"
-//   phase 3:        "🏆 Mira Bridge · Rock solid"
-function statusLine(s, voteCount) {
-  const votes = voteCount + (voteCount === 1 ? " vote" : " votes");
-  const n = s.votesToNext;
-  if (!s.complete)   return `${votes}${n ? ` · +${n} to finish` : ""}`;
-  if (s.phase === 1) return `${votes}${n ? ` · +${n} to a winner` : ""}`;
-
-  const who = s.winners.length > 1
-    ? `🏆 ${s.winners.map(displayWinner).join(" & ")}`
-    : `🏆 ${displayWinner(s.winners[0])}`;
+// Describe the current status as { lead, remaining, tail } parts. The vote count
+// (lead) is ALWAYS shown — it's interesting info the user wants visible. The
+// `remaining` number gets its own element so we can animate it when it changes.
+// BLIND TEST: never name a track here; describe the STATE only. Names are
+// revealed only on the results screen.
+//   before ranking:  lead="12 votes"  remaining=3  tail="to a ranking"
+//   ranking ready:    lead="14 votes"  tail="Ranking ready ✓ · Confident"
+//                     (+ remaining=5 tail2="to firmer confidence" if not settled)
+function statusParts(s, voteCount) {
+  const lead = voteCount + (voteCount === 1 ? " vote" : " votes");
   const tier = TIER_LABEL[s.tier] || s.tier;
-  if (s.phase === 2) return `${who} · +${n} to settle rest`;
-  return `${who} · ${tier}`;     // phase 3: settled; keep going only for confidence
+  if (!s.preliminary) {
+    // counting down to a usable ranking
+    const tail = s.topIsTie ? "to break the tie up top" : s.nextLabel; // "to a ranking"
+    return { lead, remaining: s.votesToNext, tail };
+  }
+  // ranking is ready — say so for certain
+  if (s.votesToNext > 0) {
+    return { lead, ready: true, remaining: s.votesToNext, tail: "to firmer confidence", tier };
+  }
+  return { lead, ready: true, remaining: 0, tail: "fully settled", tier };
 }
 
-// Map an item key to a readable winner name for the status line.
-function displayWinner(key) {
-  const it = rater && rater.itemByKey && rater.itemByKey.get(key);
-  return it ? it.name || it.file.replace(/\.[^.]+$/, "") : key;
-}
+// remember the last remaining-count so we can flash the delta (−1 / +2) on change
+let _lastRemaining = null;
 
 // Update the progress bar + readout from the rater's current status.
 function updatePrecision() {
   if (!rater) return;
   const s = rater.status();
   els.progressFill.style.width = Math.round(s.fill * 100) + "%";
-  els.compareCount.textContent = statusLine(s, rater.voteCount);
 
-  // bar markers now mean: good = winner locked, better = top settled,
-  // best = fully settled & high confidence (the "good enough to stop" marker
-  // is at the phase-2 boundary, i.e. "better").
+  const p = statusParts(s, rater.voteCount);
+  renderStatusLine(p);
+
+  // bar markers: good = ranking ready, better = stop-ok, best = fully+confident.
   const bar = document.querySelector(".progress-bar.precision");
   if (bar) {
     bar.classList.toggle("lit-good",   s.winnerLocked);
@@ -1204,7 +1236,65 @@ function updatePrecision() {
     bar.classList.toggle("lit-best",   s.phase === 3 && s.tier === "rock-solid");
   }
 
+  // tell the "Show results" button whether the ranking is ready (and how many
+  // votes remain if not), so it can disable + show "(need X more)".
+  updateResultsButton(s);
+
   if (DEBUG) renderDebug();
+}
+
+// Render the status readout into #compareCount, with the remaining-count in its
+// own <span> so we can flash a -1/+2 delta beside it when it changes.
+function renderStatusLine(p) {
+  const el = els.compareCount;
+  if (!el) return;
+  const parts = [];
+  parts.push(`<span class="sl-votes">${p.lead}</span>`);
+  if (p.ready) {
+    parts.push(`<span class="sl-ready">Ranking ready ✓</span>`);
+    if (p.tier) parts.push(`<span class="sl-tier">${p.tier}</span>`);
+    if (p.remaining > 0) {
+      parts.push(`<span class="sl-rem">+<span class="sl-num">${p.remaining}</span> ${p.tail}</span>`);
+    }
+  } else {
+    parts.push(`<span class="sl-rem">+<span class="sl-num">${p.remaining}</span> ${p.tail}</span>`);
+  }
+  el.innerHTML = parts.join(' <span class="sl-dot">·</span> ');
+
+  // flash the delta if the remaining number changed
+  const cur = p.remaining;
+  if (_lastRemaining != null && cur !== _lastRemaining) {
+    const delta = cur - _lastRemaining;
+    flashDelta(el.querySelector(".sl-num"), delta);
+  }
+  _lastRemaining = cur;
+}
+
+// Pop a small "-1" / "+2" bubble next to the number and let CSS animate it.
+function flashDelta(numEl, delta) {
+  if (!numEl || !delta) return;
+  const b = document.createElement("span");
+  b.className = "sl-delta " + (delta < 0 ? "down" : "up");
+  b.textContent = (delta > 0 ? "+" : "") + delta;
+  numEl.appendChild(b);
+  // remove after the animation so they don't pile up
+  setTimeout(() => { if (b.parentNode) b.parentNode.removeChild(b); }, 900);
+}
+
+// Reflect "ranking ready / need X more" on the Show-results button.
+function updateResultsButton(s) {
+  const btn = document.getElementById("finishRanking");
+  if (!btn) return;
+  if (s.preliminary) {
+    btn.disabled = false;
+    btn.classList.add("ready");
+    btn.textContent = "✓ Show results";
+  } else {
+    btn.disabled = false;   // never hard-block — user can always peek
+    btn.classList.remove("ready");
+    const n = s.votesToNext;
+    btn.textContent = n > 0 ? `Show results (${n} more for a full ranking)` : "Show results";
+  }
 }
 
 /* ------------------------------------------------------------------ *

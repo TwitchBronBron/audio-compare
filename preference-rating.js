@@ -128,6 +128,24 @@
       return { i, j, games: g, wins: w, loss: l, leader, state };
     }
 
+    // Transitive tiebreak: when i and j are directly even, compare how each did
+    // against their SHARED opponents (A>B, B>C ⇒ A edges C). Returns a signed
+    // number — positive means i is transitively ahead of j, 0 means even/no
+    // shared data. Used ONLY to break a direct tie, never to override a direct
+    // decided result.
+    transitiveEdge(i, j) {
+      let edge = 0;
+      for (let k = 0; k < this.n; k++) {
+        if (k === i || k === j) continue;
+        const gi = this.games[i][k], gj = this.games[j][k];
+        if (gi === 0 || gj === 0) continue;             // need both vs k
+        const ni = (this.wins[i][k] - this.wins[k][i]) / gi;  // i's net vs k
+        const nj = (this.wins[j][k] - this.wins[k][j]) / gj;  // j's net vs k
+        edge += ni - nj;
+      }
+      return edge;
+    }
+
     // P(i is preferred over j) as a simple smoothed win rate — handy for the UI
     // and tests. Laplace-smoothed so an unseen pair reads 0.5.
     winProb(aKey, bKey) {
@@ -163,67 +181,169 @@
           if (g > 0) { played[i]++; totalVotesPer[i] += g; totalWinsPer[i] += this.wins[i][j]; }
           if (j <= i) continue;
           const ps = this.pairState(i, j);
-          if (ps.state === "decided") {
-            if (ps.leader === i) { score[i] += 1; score[j] -= 1; decidedWins[i]++; decidedLoss[j]++; }
-            else                 { score[j] += 1; score[i] -= 1; decidedWins[j]++; decidedLoss[i]++; }
-          } else if (ps.state === "provisional" && ps.leader != null) {
-            // half weight: provisional direction informs the order but yields to
-            // any decided result and to a true score difference.
-            if (ps.leader === i) { score[i] += 0.5; score[j] -= 0.5; }
-            else                 { score[j] += 0.5; score[i] -= 0.5; }
+          // Score each pair by its NET win fraction, so a lean counts as a lean:
+          // 3–0 → ±1, 2–1 → ±1/3, 1–1 → 0. This is what stops everything from
+          // collapsing to score 0 (and then chain-merging into one giant tie):
+          // a 2–1 means you mildly preferred the leader, and the score now SAYS so
+          // instead of treating 2–1 as a dead tie worth nothing.
+          if (g > 0) {
+            const net = (this.wins[i][j] - this.wins[j][i]) / g;  // -1..+1
+            score[i] += net; score[j] -= net;
           }
-          // unseen / tied contribute 0
+          // decided record (for the W–L readout): only matchups past the floor
+          // with a clear winner count as a confirmed win/loss.
+          if (ps.state === "decided") {
+            if (ps.leader === i) { decidedWins[i]++; decidedLoss[j]++; }
+            else                 { decidedWins[j]++; decidedLoss[i]++; }
+          }
+        }
+      }
+
+      // ---- Copeland score: (matchups won − matchups lost) across the field ----
+      // This is the backbone of the ranking. Unlike a pairwise comparator, it is
+      // CYCLE-PROOF: it always yields a consistent order, and within a cycle it
+      // favors whoever beat the most others. A "win" over j counts when the pair
+      // is decided (one side clearly preferred); a provisional lean counts at half
+      // so a single pass still orders sensibly without overriding decided results.
+      const copeland = new Array(n).fill(0);
+      for (let i = 0; i < n; i++) {
+        for (let j = 0; j < n; j++) {
+          if (i === j) continue;
+          const ps = this.pairState(Math.min(i, j), Math.max(i, j));
+          if (ps.state === "decided") {
+            copeland[i] += ps.leader === i ? 1 : -1;
+          } else if (ps.state === "provisional" && ps.leader != null) {
+            copeland[i] += ps.leader === i ? 0.5 : -0.5;
+          }
         }
       }
 
       const rows = this.keys.map((key, i) => ({
         key,
-        score: score[i],
-        // decided record: matchups CONFIRMED won/lost (crossed the floor)
+        score: copeland[i],            // Copeland score drives the ranking
+        net: score[i],                 // net win-fraction (tiebreak + display)
         wins: decidedWins[i],
         losses: decidedLoss[i],
         played: played[i],
-        // overall record across ALL votes — the intuitive "you picked it 5 of 7
-        // times" readout the results screen shows (decided-only reads as 0–0
-        // early on, which looks like no record at all).
         votesWon: totalWinsPer[i],
         votesTotal: totalVotesPer[i],
-        // overall win rate across all meetings — a cosmetic readout only
         winRate: totalVotesPer[i] ? totalWinsPer[i] / totalVotesPer[i] : 0,
-        // display rating (cosmetic): 1500 centered, scaled by net matchup score
-        r: 1500 + 80 * score[i],
+        r: 1500 + 80 * copeland[i],
         _i: i,
       }));
 
-      // sort best-first by score, then by direct head-to-head, then by win rate
+      // Order by Copeland; break Copeland ties by the DIRECT decided head-to-head
+      // (if you decisively picked A over B, A outranks B when their Copeland scores
+      // tie — direct preference is king), then net win-fraction, then win rate.
       rows.sort((a, b) => {
-        if (b.score !== a.score) return b.score - a.score;
-        const wa = this.wins[a._i][b._i], wb = this.wins[b._i][a._i];
-        if (wa !== wb) return wb - wa;
-        return b.winRate - a.winRate;
+        if (Math.abs(b.score - a.score) > 1e-9) return b.score - a.score;
+        const ps = this.pairState(Math.min(a._i, b._i), Math.max(a._i, b._i));
+        if (ps.state === "decided") return ps.leader === a._i ? -1 : 1;
+        return (b.net - a.net) || (b.winRate - a.winRate);
       });
 
-      // assign cluster ranks: two adjacent rows are in the SAME cluster when
-      // neither is `decided` over the other (i.e. tied / provisional-even /
-      // unseen between them AND equal score). Olympic-style shared rank numbers.
+      // ---- cluster ranks via cycle detection ------------------------------
+      // Two items belong in the same TIE CLUSTER when you have no consistent
+      // preference between them — which happens when they're in a directed CYCLE
+      // of decided results (rock-paper-scissors: A>B, B>C, C>A), OR they're a
+      // confirmed direct tie, OR neither has separated from the other yet. We find
+      // these as strongly-connected components of the "decided beats" graph,
+      // augmented so confirmed-tied / unresolved-even pairs also link.
+      const clusterId = this._clusters(rows);
+      // assign Olympic ranks per cluster in sorted order
       let rank = 1;
       for (let p = 0; p < rows.length; p++) {
-        if (p === 0) { rows[p].rank = 1; continue; }
-        const prev = rows[p - 1], cur = rows[p];
-        const ps = this.pairState(prev._i, cur._i);
-        const mergeable = cur.score === prev.score && ps.state !== "decided";
-        if (mergeable) {
-          rows[p].rank = prev.rank;          // same cluster
+        if (p > 0 && clusterId[rows[p]._i] === clusterId[rows[p - 1]._i]) {
+          rows[p].rank = rows[p - 1].rank;     // same cluster → shared rank
         } else {
-          rows[p].rank = p + 1;              // new cluster (Olympic gap)
+          rows[p].rank = p + 1;                // new cluster (Olympic gap)
         }
       }
-      // mark tie clusters (any rank shared by >1 row)
       const countByRank = {};
       for (const row of rows) countByRank[row.rank] = (countByRank[row.rank] || 0) + 1;
       for (const row of rows) { row.tied = countByRank[row.rank] > 1; delete row._i; }
 
       return rows;
+    }
+
+    /* ---- cluster detection (Tarjan SCC on the "tie/cycle" graph) -------- *
+     * Build a directed graph where i → j means "i is at-least-as-good as j with
+     * no clear loss to j": specifically we add BOTH directions i↔j when the pair
+     * is NOT decided (a tie / even / unresolved link), and only the winning
+     * direction when decided. Strongly-connected components of this graph are the
+     * tie clusters: a cycle of decided results (A>B>C>A) forms one SCC, and so
+     * does any chain joined by ties. Returns an array clusterId[itemIndex].
+     *
+     * NOTE on chaining: we only add the undirected tie-link for a pair that is a
+     * CONFIRMED tie (state==="tied") or genuinely unresolved between two items
+     * that are ADJACENT in Copeland order — so distant items don't chain into one
+     * blob. Decided pairs never add a back-edge, so a clean A>B>C stays separate.
+     * -------------------------------------------------------------------- */
+    _clusters(sortedRows) {
+      const n = this.n;
+      // Copeland score per item (recomputed cheaply; matches ranking()).
+      const cop = new Array(n).fill(0);
+      for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) {
+        if (i === j) continue;
+        const ps = this.pairState(Math.min(i, j), Math.max(i, j));
+        if (ps.state === "decided") cop[i] += ps.leader === i ? 1 : -1;
+        else if (ps.state === "provisional" && ps.leader != null) cop[i] += ps.leader === i ? 0.5 : -0.5;
+      }
+      const adj = Array.from({ length: n }, () => []);
+      for (let i = 0; i < n; i++) {
+        for (let j = 0; j < n; j++) {
+          if (i === j) continue;
+          const a = Math.min(i, j), b = Math.max(i, j);
+          const ps = this.pairState(a, b);
+          if (ps.state === "decided") {
+            // single directed edge winner → loser. A CYCLE of these (A>B>C>A)
+            // becomes one SCC = a tie cluster, which is what we want.
+            if (ps.leader === i) adj[i].push(j);
+          } else if (ps.state === "tied" && Math.abs(cop[i] - cop[j]) < 1e-9) {
+            // CONFIRMED tie AND equal standing → genuine equivalence; bidirectional
+            // link so they share a cluster. The equal-Copeland guard stops a pair
+            // that merely SPLIT head-to-head (but sits at different overall
+            // standings) from bridging unrelated parts of the field into one blob.
+            adj[i].push(j);
+          } else if (ps.state === "provisional" && ps.leader != null) {
+            // an unsettled lean is NOT a tie — it's a tentative order. Add the
+            // leader's directed edge so it sorts, but no back-edge (so it can't
+            // merge a cluster). An even provisional (1–1) adds nothing.
+            if (ps.leader === i) adj[i].push(j);
+          }
+          // unseen contributes no edge
+        }
+      }
+
+      // Tarjan's strongly-connected components.
+      const idxOf = new Array(n).fill(-1), low = new Array(n).fill(0);
+      const onStack = new Array(n).fill(false), comp = new Array(n).fill(-1);
+      const stack = []; let counter = 0, compId = 0;
+      const dfs = (u) => {
+        // iterative to avoid deep recursion (n is tiny but keep it safe)
+        const work = [[u, 0]];
+        while (work.length) {
+          const top = work[work.length - 1];
+          const v = top[0];
+          if (top[1] === 0) { idxOf[v] = low[v] = counter++; stack.push(v); onStack[v] = true; }
+          let recursed = false;
+          for (let e = top[1]; e < adj[v].length; e++) {
+            const w = adj[v][e];
+            if (idxOf[w] === -1) { top[1] = e + 1; work.push([w, 0]); recursed = true; break; }
+            else if (onStack[w]) low[v] = Math.min(low[v], idxOf[w]);
+          }
+          if (recursed) continue;
+          if (low[v] === idxOf[v]) {
+            let w;
+            do { w = stack.pop(); onStack[w] = false; comp[w] = compId; } while (w !== v);
+            compId++;
+          }
+          work.pop();
+          if (work.length) { const p = work[work.length - 1]; low[p[0]] = Math.min(low[p[0]], low[v]); }
+        }
+      };
+      for (let i = 0; i < n; i++) if (idxOf[i] === -1) dfs(i);
+      return comp;
     }
 
     /* ---- completion / phase / confidence ------------------------------- *
@@ -270,31 +390,53 @@
       // ---- winner lock: is the top boundary resolved? --------------------
       // Locked if the top cluster is a confirmed tie (winner's circle) OR the
       // #1 vs #2 boundary is `decided` with margin ≥ WIN_MARGIN over the floor.
+      // The "winner" is the set of items near the very top that are close enough
+      // to still be in contention. We find them by net score: anyone within
+      // ~one matchup of the leader is a contender for #1.
+      const topScore = rows[0].score;
+      const contenders = rows.filter(r => (topScore - r.score) < 1 - 1e-9);
+      const contenderIdx = contenders.map(r => this.idx.get(r.key));
+
+      // winnerLocked, topIsTie, the contenders to serve head-to-head, and a
+      // stable "votes to the winner milestone" estimate.
+      let winnerLocked, topIsTie = false, votesToWinner = 0;
+      let tieContenders = [];   // keys to serve against each other to break a top tie
+
+      if (!complete) {
+        // Still mid first-pass: the only blocker to a usable ranking is finishing
+        // the pass. Don't chase tie-breaks yet (it would over-count and starve
+        // coverage). tieContenders stays empty until the pass is done.
+        winnerLocked = false;
+        votesToWinner = unseen;
+      } else if (contenders.length <= 1) {
+        // One item clearly ahead on score → it's the winner. (Score lead ≥ 1 means
+        // it beat the field about one matchup more than #2 — a clear lead, no
+        // decisive DIRECT margin required.)
+        winnerLocked = true;
+        votesToWinner = 0;
+      } else {
+        // Several items tied for #1. Per design: make the user pick BETWEEN the
+        // contenders head-to-head — 2–4 votes should reveal a winner. We're
+        // "locked" once every contender pair has been compared enough (floor) to
+        // either separate them (one pulls ahead on score) or confirm a true tie.
+        tieContenders = contenders.map(r => r.key);
+        let need = 0;
+        for (let a = 0; a < contenderIdx.length; a++)
+          for (let b = a + 1; b < contenderIdx.length; b++) {
+            const ps = this.pairState(contenderIdx[a], contenderIdx[b]);
+            if (ps.games < PreferenceCore.MEET_FLOOR) need += (PreferenceCore.MEET_FLOOR - ps.games);
+          }
+        // If, after enough head-to-heads, the contenders are STILL score-tied,
+        // it's a genuine winner's circle: lock it and crown co-winners.
+        topIsTie = need === 0;
+        winnerLocked = need === 0;
+        votesToWinner = Math.max(1, need);
+      }
+
+      // The crowned winner(s): the contenders, but only those sharing the very
+      // top cluster rank (so a tie that got broken shows a single winner).
       const topRank = rows[0].rank;
       const winners = rows.filter(r => r.rank === topRank).map(r => r.key);
-      let winnerLocked, votesToWinner = 0;
-      if (winners.length > 1) {
-        // top is a tie cluster — locked only once those pairs cleared the floor
-        winnerLocked = true;
-        for (let a = 0; a < winners.length; a++)
-          for (let b = a + 1; b < winners.length; b++) {
-            const ps = this.pairState(this.idx.get(winners[a]), this.idx.get(winners[b]));
-            if (ps.games < PreferenceCore.MEET_FLOOR) { winnerLocked = false; votesToWinner += (PreferenceCore.MEET_FLOOR - ps.games); }
-          }
-      } else {
-        const top = rows[0], second = rows[1];
-        const ti = this.idx.get(top.key), si = this.idx.get(second.key);
-        const ps = this.pairState(ti, si);
-        const margin = Math.abs(ps.wins - ps.loss);
-        winnerLocked = ps.games >= PreferenceCore.MEET_FLOOR &&
-                       ps.state === "decided" && margin >= PreferenceCore.WIN_MARGIN;
-        if (!winnerLocked) {
-          // rough votes to lock: reach floor, then enough to hit the margin
-          const toFloor = Math.max(0, PreferenceCore.MEET_FLOOR - ps.games);
-          const toMargin = Math.max(0, PreferenceCore.WIN_MARGIN - margin);
-          votesToWinner = Math.max(1, toFloor, Math.ceil(toMargin / 2) + toFloor);
-        }
-      }
 
       // ---- competence: weakest adjacent boundary -------------------------
       // Each adjacent boundary's "sureness": a decided gap = margin·backing; a
@@ -345,25 +487,35 @@
       else tier = "pretty-sure";
 
       // ---- next milestone + votes remaining ------------------------------
+      // Two regimes, per design:
+      //   BEFORE the ranking is usable (no winner locked): a countdown to the
+      //     "preliminary ranking ready" point. This is the number that should
+      //     mostly tick DOWN as you vote.
+      //   AFTER (preliminary ready): the ranking is viewable any time; the
+      //     countdown becomes "votes to the next confidence step".
+      // `preliminary` is the flag the UI uses to tell the user, for certain,
+      // that they can view results whenever they want.
+      const preliminary = winnerLocked;     // a trustworthy ranking exists
       let votesToNext, nextLabel;
-      if (!complete) {
-        votesToNext = unseen;
-        nextLabel = "complete the first pass";
-      } else if (phase === 1) {
-        votesToNext = Math.max(1, votesToWinner);
-        nextLabel = "find your winner";
-      } else if (phase === 2) {
+      if (!preliminary) {
+        // votes to a usable ranking: whichever is the live blocker — finishing
+        // the first pass, or breaking the tie at the top.
+        votesToNext = Math.max(1, votesToWinner || unseen);
+        nextLabel = "to a ranking";
+      } else if (!allSettled) {
+        // ranking ready; remaining work tightens the lower ranks
         votesToNext = Math.max(1, provisionalNeed);
-        nextLabel = "settle the rest of the ranking";
+        nextLabel = "to settle the rest";
       } else {
         votesToNext = 0;
-        nextLabel = "raise confidence (optional)";
+        nextLabel = "fully settled";
       }
 
       return {
-        complete, phase, winnerLocked, winners,
+        complete, phase, winnerLocked, winners, topIsTie,
+        preliminary, tieContenders,
         competence, tier, fill,
-        stopOk: phase >= 2,
+        stopOk: preliminary,            // can view results for certain once true
         votesToNext, nextLabel,
         counts: { unseen, provisional, settled, total },
       };
@@ -386,32 +538,46 @@
       const rows = this.ranking();
       const pos = new Map(rows.map((row, r) => [row.key, r]));
 
+      // ROUND-ROBIN by design: the dominant driver is "fewest meetings". We always
+      // serve from the least-played tier of pairs, so the whole field gets even,
+      // repeated coverage (everyone vs everyone, then again) instead of fixating on
+      // a couple of close pairs (which is how one pair hit 13 games while others got
+      // 3). Closeness/adjacency is only a gentle tiebreak AMONG the least-played.
+      let minGames = Infinity;
+      for (let i = 0; i < this.n; i++)
+        for (let j = i + 1; j < this.n; j++)
+          minGames = Math.min(minGames, this.games[i][j]);
+
+      // Sporadic tie-for-first breaker: only when the first full round-robin is in
+      // (every pair played ≥1) AND there's a real tie at the top, give the tied
+      // contenders' pairs a modest boost — enough to seed a round, not to dominate
+      // it. The round-robin floor above still pulls every other pair along.
+      const topScore = rows[0].score;
+      const contenderKeys = rows.filter(r => (topScore - r.score) < 1 - 1e-9).map(r => r.key);
+      const isContender = new Set(contenderKeys.map(k => this.idx.get(k)));
+      const breakTopTie = contenderKeys.length > 1 && minGames >= 1;
+
       const candidates = [];
       let total = 0;
       for (let i = 0; i < this.n; i++) {
         for (let j = i + 1; j < this.n; j++) {
-          const ps = this.pairState(i, j);
+          const g = this.games[i][j];
           const ki = this.keys[i], kj = this.keys[j];
+          // Restrict to the least-played tier: this enforces full round-robin
+          // cycling. Only pairs at the current minimum game count are eligible,
+          // so no pair gets a 2nd meeting until every pair has had its 1st, etc.
+          if (g > minGames) continue;
           const adjacency = 1 / (1 + Math.abs(pos.get(ki) - pos.get(kj)));
-          let w = 0;
-          if (ps.state === "unseen") {
-            w = 100;                                   // top priority: complete the pass
-          } else if (ps.state === "provisional") {
-            const toFloor = PreferenceCore.MEET_FLOOR - ps.games;
-            w = 10 + 6 * toFloor + 8 * adjacency;      // close-in-standings, under-met
-          } else {
-            // settled: only a faint pull so grinders can firm up the weakest gap
-            const margin = ps.games ? Math.abs(ps.wins - ps.loss) / ps.games : 1;
-            w = 0.4 * (1 - margin) * adjacency;
+          // base weight ~even; a gentle pull toward close-in-standings pairs so,
+          // within a round, the informative matchups come a little sooner.
+          let w = 1 + 0.5 * adjacency;
+          // modest, sporadic boost to seed a tie-break among the top contenders.
+          if (breakTopTie && isContender.has(i) && isContender.has(j) &&
+              this.pairState(i, j).state !== "decided") {
+            w += 2;
           }
-          if (w > 0) { candidates.push({ i, j, w }); total += w; }
+          candidates.push({ i, j, w }); total += w;
         }
-      }
-      if (!candidates.length) {
-        // everything maximally settled — fall back to a random distinct pair
-        let i = Math.floor(this.rng() * this.n), j = Math.floor(this.rng() * (this.n - 1));
-        if (j >= i) j++;
-        candidates.push({ i, j, w: 1 }); total = 1;
       }
 
       let pick = candidates[0];
@@ -618,8 +784,9 @@
     (function () {
       const c = new PreferenceCore(["A", "B", "C"], { rng: makeRng(3) });
       const s0 = c.status();
-      ok(s0.nextLabel === "complete the first pass", "starts by asking to complete a pass");
-      ok(s0.votesToNext === 3, "3 unseen pairs ⇒ 3 votes to complete");
+      ok(!s0.preliminary, "no votes ⇒ no preliminary ranking yet");
+      ok(s0.nextLabel === "to a ranking", "starts by counting down to a ranking");
+      ok(s0.votesToNext === 3, "3 unseen pairs ⇒ 3 votes to a ranking");
     })();
 
     // ---- 15. replay() == sequential vote() -------------------------------

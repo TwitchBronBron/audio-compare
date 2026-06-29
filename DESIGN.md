@@ -86,30 +86,43 @@ same number.**
 > free to leave. Grinder: same answer, watches confidence climb, and knows they
 > already had a valid answer the whole time.
 
-## The ranking — clusters, not a forced total order
+## The ranking — Copeland score + cycle-aware clusters
 
-Rank is built so it never contradicts a user's direct, decided preference.
+Rank is built so it never contradicts a user's direct, decided preference, and
+so it stays consistent even when preferences contain cycles (which real
+subjective preferences often do — see below).
 
-1. **Score each item by matchups won against the field**, each opponent counted
-   ONCE (so beating Taylor 9–0 is worth the same as 5–4: it's one matchup won,
-   not nine points — requirement #2). For item i vs each opponent j it has met:
-   `+1` if i is decided over j, `-1` if j is decided over i, `0` if tied or
-   provisional-even.
-2. **Sort by that score.** Ties in score break by the direct head-to-head
-   between the two items; if that's also even, they form a **tied cluster**.
-3. **Adjacent items that are `tied` (or score-tied with an even head-to-head)
-   merge into one cluster** sharing a rank number (Olympic style: two "3rd",
-   then "5th").
+1. **Copeland score**: each item scores `(matchups won − matchups lost)` against
+   the field, each opponent counted ONCE (a 9–0 blowout is worth the same as
+   5–4: one matchup won, not nine points). Decided pair → ±1; an unsettled
+   provisional lean → ±0.5; `tied`/`unseen` → 0. Unlike a pairwise comparator,
+   Copeland is **cycle-proof** — it always yields a single consistent order, and
+   within a cycle it favors whoever beat the most others.
+2. **Order** by Copeland, breaking ties by the direct decided head-to-head
+   (direct preference is king), then net win-fraction, then overall win rate.
+3. **Cluster** via strongly-connected components of the "decided beats" graph
+   (Tarjan SCC). Items you have no consistent preference among end up in the same
+   cluster and share an Olympic rank (two "1st", then "3rd"). A cluster forms
+   from EITHER:
+     - a **cycle** of decided results (A>B, B>C, C>A — rock-paper-scissors), or
+     - a **confirmed tie** between items at equal Copeland standing.
+   Decided results that don't form a cycle never merge; an unsettled
+   (provisional) pair is a *tentative order*, not a tie, so it does not merge.
 
-This applies at **every position, including #1.** If the top two keep splitting
-past the floor, there is no single winner — there's a **winner's circle** (a
-2- or 3-way tie for first), shown in arbitrary/alphabetical order within the
-group. "No clear #1 after enough tries" is not a stuck state; it *is* the
-answer.
+### Cycles are a real outcome, not a bug
 
-Genuine rock-paper-scissors knots (A>B>C>A) can leave one unavoidable
-violation; rank those by overall matchups-won and flag the leftover pair as
-`tied`/close rather than hiding it.
+With enough votes on close items, preferences often form a loop: you pick A over
+B, B over C, C over A depending on what you're A/B-ing in the moment. **No
+ranking — not this one, not Bradley–Terry, not a bracket — can order a cycle
+without violating one of your direct picks.** So instead of inventing a false
+#1, the tool reports the cycle members as a **tied cluster** ("you preferred
+these in a loop — no consistent favorite"). This is the same principle as a
+confirmed tie, applied to cycles: when the data says "these are equivalent to
+you," we say so rather than faking a winner.
+
+This applies at **every position, including #1**: a cycle (or confirmed tie) at
+the top is a **winner's circle** of co-winners, shown together. "No clear #1" is
+not a stuck state — it *is* the answer.
 
 ## The progress bar — three phases, one bar
 
@@ -170,17 +183,25 @@ leaving. We estimate work to the **next milestone** only (never the far finish):
 Always display the smallest, nearest milestone ("~4 votes to your winner"),
 because "37 to fully resolve" makes people quit.
 
-## Matchmaking
+## Matchmaking — round-robin cycles
 
-Serve only pairs that still need work, so the engine can't loop the user on an
-already-settled pair (the old tool re-asked one near-tie ~10×):
+The matchmaker's job is EVEN coverage, not chasing close pairs. (An earlier
+version over-weighted "closeness + adjacency" and ground one near-tie to 13
+meetings while other pairs got 3 — that lopsided sampling is exactly what
+manufactures noisy decided results and spurious cycles.)
 
-- Never serve a `decided` or confirmed-`tied` pair.
-- Prefer `unseen` pairs first (reach completion fast — serves the casual voter).
-- Then prefer `provisional` pairs, weighted toward those closest in the current
-  standings (settling the order where it actually matters) and those with the
-  fewest meetings.
-- Cap repeats so no single pair dominates a session.
+- **Dominant rule: serve from the least-played tier.** Only pairs at the current
+  minimum game count are eligible, so no pair gets its 2nd meeting until every
+  pair has had its 1st, its 3rd until every pair has a 2nd, etc. This is a
+  repeated full round-robin: everyone vs everyone, then everyone vs everyone
+  again — exactly even coverage.
+- **Closeness/adjacency is only a gentle tiebreak** among the equally-least-
+  played, so within a round the informative matchups come a little sooner.
+- **Tie-for-first breaking is SPORADIC, not dominant.** Once the first full
+  round-robin is in and there's a real tie at the top, the tied contenders' pairs
+  get a *modest* boost — enough to seed a round, not to fixate. The round-robin
+  floor still pulls every other pair along, so a new round may *open* with the
+  tied leaders but still gives every pair another meeting.
 
 ## Constants summary
 
