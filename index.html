@@ -268,6 +268,7 @@
       <div class="pick-row" id="pickRow"></div>
 
       <div class="toolbar center" style="justify-content:center;margin-top:18px;">
+        <button class="ghost" id="shareTest">🔗 Copy test link</button>
         <button class="ghost" id="compareBack">← Back to all sets</button>
         <button class="ghost" id="restartAll">↺ Start over</button>
       </div>
@@ -277,8 +278,8 @@
   <!-- STEP 3: results -->
   <section id="step-results" class="hidden">
     <div class="card">
-      <h2 style="margin-top:0;">Final ranking</h2>
-      <p class="muted">Your ranking, best at the top. Click any track to hear it, or click a waveform to jump to a spot.</p>
+      <h2 style="margin-top:0;" id="resultsHeading">Final ranking</h2>
+      <p class="muted" id="resultsBlurb">Your ranking, best at the top. Click any track to hear it, or click a waveform to jump to a spot.</p>
 
       <div class="vs-wrap" id="resultsLanes"></div>
 
@@ -293,6 +294,8 @@
       </div>
 
       <div class="toolbar" style="margin-top:18px;">
+        <button class="ghost" id="shareTestFromResults">🔗 Copy test link</button>
+        <button class="ghost" id="shareResults">🔗 Copy results link</button>
         <button class="ghost" id="resultsStartOver">↺ Rank this set again</button>
         <button class="ghost" id="resultsRestart">← Back to all sets</button>
       </div>
@@ -789,11 +792,52 @@ async function init() {
     const entries = await listDir(AUDIO_ROOT);
     folderNames = entries.filter(e => e.type === "directory").map(e => e.name);
     refreshFolderList();
-    // Always land on the set list — per-folder progress is still saved, so
-    // picking a set resumes it, but we never auto-jump into one on load.
+
+    // Shareable links: ?set=<folder> drops the visitor straight into a set.
+    //   ?set=Foo               → take the test (starts from where they left off)
+    //   ?set=Foo&view=results  → skip straight to the listening/results view
+    const params = new URLSearchParams(location.search);
+    const set = params.get("set");
+    if (set && folderNames.includes(set)) {
+      startSet(set, { view: params.get("view") === "results" ? "results" : "compare" });
+    }
+    // Otherwise land on the set list — per-folder progress is still saved, so
+    // picking a set resumes it.
   } catch (e) {
     els.selectErr.textContent = "Couldn't load /audio listing: " + e.message;
   }
+}
+
+// Update the address bar so the current view is itself a shareable link
+// (without adding a history entry on every navigation).
+function syncUrl(folder, view) {
+  const params = new URLSearchParams(location.search);
+  if (folder) {
+    params.set("set", folder);
+    if (view === "results") params.set("view", "results");
+    else params.delete("view");
+  } else {
+    params.delete("set");
+    params.delete("view");
+  }
+  const qs = params.toString();
+  history.replaceState(null, "", location.pathname + (qs ? "?" + qs : ""));
+}
+
+// Build an absolute share link for the given folder/view.
+function shareLink(folder, view) {
+  const params = new URLSearchParams();
+  params.set("set", folder);
+  if (view === "results") params.set("view", "results");
+  return location.origin + location.pathname + "?" + params.toString();
+}
+
+// Copy a share link to the clipboard and flash feedback on the button.
+async function copyShareLink(btn, folder, view) {
+  await navigator.clipboard.writeText(shareLink(folder, view));
+  const old = btn.textContent;
+  btn.textContent = "✓ Copied!";
+  setTimeout(() => { btn.textContent = old; }, 1400);
 }
 
 function makeItem(folder, filename) {
@@ -805,7 +849,8 @@ function makeItem(folder, filename) {
   };
 }
 
-async function startSet(folder) {
+async function startSet(folder, opts) {
+  const wantResults = opts && opts.view === "results";
   currentFolder = folder;
   els.selectErr.textContent = "";
   Engine.reset();
@@ -816,6 +861,15 @@ async function startSet(folder) {
       .map(e => e.name);
     if (files.length < 2) {
       els.selectErr.textContent = "Need at least 2 audio files to compare in \"" + folder + "\".";
+      return;
+    }
+
+    // "Skip to results" link — a listening view with no ranking. Show every
+    // track (names revealed) so a visitor can compare without taking the test.
+    if (wantResults) {
+      els.headerSub.textContent = folder;
+      const items = files.map(fn => makeItem(folder, fn));
+      showResults(items, { ranked: false });
       return;
     }
 
@@ -849,6 +903,7 @@ async function startSet(folder) {
     };
 
     show("compare");
+    syncUrl(folder, "compare");
     const ranked = await sorter.sort();
     state.done = true;
     state.ranking = ranked.map(it => it.file);
@@ -965,32 +1020,47 @@ function renderComparison(a, b, onPick) {
   else if (refTrack) refTrack.audio.addEventListener("canplay", startWhenReady, { once: true });
 }
 
-// Results — same DAW lanes, one per ranked item, top = most preferred.
-// The big reveal: real names are shown outright here.
-function showResults(ranked) {
+// Results screen — same DAW lanes, real names revealed. Two modes:
+//   ranked (default): the user's finished ranking, medals + numbers, top = best.
+//   listening (opts.ranked === false): a shared "skip to results" link — every
+//     track shown so a visitor can compare, but in a neutral order with no
+//     ranking implied (no medals, no rank numbers).
+function showResults(items, opts) {
+  const isRanked = !(opts && opts.ranked === false);
   Engine.reset();
-  els.headerSub.textContent = currentFolder + " — ranked!";
+  els.headerSub.textContent = currentFolder + (isRanked ? " — ranked!" : "");
   els.resultsLanes.innerHTML = "";
 
+  // headings + which share button is relevant for this mode
+  document.getElementById("resultsHeading").textContent = isRanked ? "Final ranking" : "Listen & compare";
+  document.getElementById("resultsBlurb").textContent = isRanked
+    ? "Your ranking, best at the top. Click any track to hear it, or click a waveform to jump to a spot."
+    : "All tracks in this set. Click any track to hear it, or click a waveform to jump to a spot.";
+  // "Rank this set again" makes no sense from a no-ranking listening view; offer to take the test instead
+  const startOverBtn = document.getElementById("resultsStartOver");
+  startOverBtn.textContent = isRanked ? "↺ Rank this set again" : "▶ Take the test";
+
   const colors = shuffled(PALETTE); // random rank→color mapping each run
-  ranked.forEach((item, i) => {
+  items.forEach((item, i) => {
     const color = colors[i % colors.length];
-    const rankCls = i === 0 ? "top1" : i === 1 ? "top2" : i === 2 ? "top3" : "";
+    const rankCls = isRanked ? (i === 0 ? "top1" : i === 1 ? "top2" : i === 2 ? "top3" : "") : "";
     const realName = item.file.replace(/\.[^.]+$/, ""); // real filename, sans extension
     const lane = buildLane({
       key: item.key,
       url: item.url,
       color,
       extraClass: "ranked " + rankCls,
-      headHTML: `<span class="rank-pill">${i + 1}</span>`,        // radio + number, fixed left column
+      // ranked view shows the position number; listening view shows just the radio dot
+      headHTML: isRanked ? `<span class="rank-pill">${i + 1}</span>` : "",
       topHTML: `<span class="nm">${escapeHtml(realName)}</span>`,  // name above the waveform
     });
     els.resultsLanes.appendChild(lane);
   });
 
-  Engine.activeKey = ranked[0] ? ranked[0].key : null; // #1 audible by default
+  Engine.activeKey = items[0] ? items[0].key : null; // first track audible by default
   onTransportTick();
   show("results");
+  syncUrl(currentFolder, "results");
 }
 
 function escapeHtml(s) {
@@ -1009,6 +1079,7 @@ function goToSelect() {
   refreshFolderList();
   show("select");
   els.headerSub.textContent = "Pick a set to start ranking";
+  syncUrl(null);
 }
 
 // Start over: wipe this folder's saved progress and run it again from scratch
@@ -1023,6 +1094,17 @@ document.getElementById("restartAll").addEventListener("click", startOverCurrent
 document.getElementById("compareBack").addEventListener("click", goToSelect);
 document.getElementById("resultsStartOver").addEventListener("click", startOverCurrent);
 document.getElementById("resultsRestart").addEventListener("click", goToSelect);
+
+// share-link buttons — grab the right link for the current set
+document.getElementById("shareTest").addEventListener("click", (e) => {
+  if (currentFolder) copyShareLink(e.currentTarget, currentFolder, "compare");
+});
+document.getElementById("shareTestFromResults").addEventListener("click", (e) => {
+  if (currentFolder) copyShareLink(e.currentTarget, currentFolder, "compare");
+});
+document.getElementById("shareResults").addEventListener("click", (e) => {
+  if (currentFolder) copyShareLink(e.currentTarget, currentFolder, "results");
+});
 
 // the header title bar also returns to the set list (when not already there)
 document.querySelector("header").addEventListener("click", () => {
