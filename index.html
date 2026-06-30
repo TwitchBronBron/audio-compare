@@ -467,16 +467,17 @@
         <span><kbd>←</kbd><kbd>→</kbd> jump 2s</span>
       </div>
 
-      <!-- Why this ranking? A transparent breakdown of every head-to-head and
-           how it built each track's score. Populated by renderExplain(). -->
-      <div id="explainWrap" class="explain-wrap"></div>
-
       <div class="toolbar" style="margin-top:18px;">
         <button class="ghost" id="shareTestFromResults">🔗 Copy test link</button>
         <button class="ghost" id="shareResults">🔗 Copy results link</button>
         <button class="ghost" id="resultsStartOver">↺ Rank this set again</button>
         <button class="ghost" id="resultsRestart">← Back to all sets</button>
       </div>
+
+      <!-- Why this ranking? A transparent breakdown of every head-to-head and
+           how it built each track's score. Populated by renderExplain().
+           Kept LAST on the page — it's the deep-dive, below the action buttons. -->
+      <div id="explainWrap" class="explain-wrap"></div>
     </div>
   </section>
 </main>
@@ -1042,13 +1043,26 @@ async function init() {
     folderNames = entries.filter(e => e.type === "directory").map(e => e.name);
     refreshFolderList();
 
-    // Shareable links: ?set=<folder> drops the visitor straight into a set.
-    //   ?set=Foo               → take the test (starts from where they left off)
-    //   ?set=Foo&view=results  → skip straight to the listening/results view
+    // Shareable links — the URL is the SOURCE OF TRUTH for routing, so reload
+    // always lands on the view the address bar names:
+    //   ?set=Foo                 → take / resume the test (compare screen)
+    //   ?set=Foo&view=ranking    → YOUR ranked results (rebuilt from your votes)
+    //   ?set=Foo&view=listen     → neutral listen-only view (shared "skip ahead")
+    // Legacy: ?view=results maps to the listen view (what old shared links meant).
     const params = new URLSearchParams(location.search);
     const set = params.get("set");
     if (set && folderNames.includes(set)) {
-      startSet(set, { view: params.get("view") === "results" ? "results" : "compare" });
+      const v = params.get("view");
+      let view;
+      if (v === "ranking") view = "ranking";
+      else if (v === "listen") view = "listen";
+      else if (v === "results") {
+        // legacy param: if this browser finished a ranking for the set, it meant
+        // "my results"; otherwise it's a shared "listen" link.
+        const st = Store.load(set);
+        view = (st && st.done && st.ranking) ? "ranking" : "listen";
+      } else view = "compare";
+      startSet(set, { view });
     }
     // Otherwise land on the set list — per-folder progress is still saved, so
     // picking a set resumes it.
@@ -1059,11 +1073,13 @@ async function init() {
 
 // Update the address bar so the current view is itself a shareable link
 // (without adding a history entry on every navigation).
+// view ∈ "compare" | "ranking" | "listen". The address bar mirrors the current
+// view so reload (and sharing) lands exactly where you are.
 function syncUrl(folder, view) {
   const params = new URLSearchParams(location.search);
   if (folder) {
     params.set("set", folder);
-    if (view === "results") params.set("view", "results");
+    if (view === "ranking" || view === "listen") params.set("view", view);
     else params.delete("view");
   } else {
     params.delete("set");
@@ -1073,11 +1089,12 @@ function syncUrl(folder, view) {
   history.replaceState(null, "", location.pathname + (qs ? "?" + qs : ""));
 }
 
-// Build an absolute share link for the given folder/view.
+// Build an absolute share link. "ranking" links are personal (only resolve for a
+// browser that has the votes); "listen" links are the neutral share-with-anyone.
 function shareLink(folder, view) {
   const params = new URLSearchParams();
   params.set("set", folder);
-  if (view === "results") params.set("view", "results");
+  if (view === "ranking" || view === "listen") params.set("view", view);
   return location.origin + location.pathname + "?" + params.toString();
 }
 
@@ -1099,7 +1116,7 @@ function makeItem(folder, filename) {
 }
 
 async function startSet(folder, opts) {
-  const wantResults = opts && opts.view === "results";
+  const view = (opts && opts.view) || "compare";   // "compare" | "ranking" | "listen"
   currentFolder = folder;
   els.selectErr.textContent = "";
   Engine.reset();
@@ -1117,26 +1134,33 @@ async function startSet(folder, opts) {
     // files; otherwise start fresh. (Vote keys are folder::filename, so a changed
     // file list means the old log can't be trusted.)
     let state = Store.load(folder);
+    const hasSameFiles = (st) => st && st.files &&
+      st.files.slice().sort().join("|") === files.slice().sort().join("|");
 
-    // "?view=results" link. If THIS browser has a finished ranking for the set,
-    // show the real RANKED results (with the "Why this ranking?" table) — a
-    // reload after finishing should not drop you into the rank-less listen view.
-    // Only when there's no local ranking (e.g. a shared link opened by someone
-    // who never took the test) do we fall back to the neutral listen view.
-    if (wantResults) {
-      const haveRanking = state && state.done && state.ranking &&
-        state.files && state.files.slice().sort().join("|") === files.slice().sort().join("|");
+    // view=listen → neutral listen-only view (the shareable "skip ahead"); no
+    // ranking implied. Always available, even with no saved votes.
+    if (view === "listen") {
       els.headerSub.textContent = folder;
-      if (haveRanking) {
-        currentFolder = folder;
-        const ranked = state.ranking.map(fn => makeItem(folder, fn));
-        showResults(ranked, { scores: state.scores });
-      } else {
-        const items = files.map(fn => makeItem(folder, fn));
-        showResults(items, { ranked: false });
-      }
+      const items = files.map(fn => makeItem(folder, fn));
+      showResults(items, { ranked: false });
       return;
     }
+
+    // view=ranking → YOUR ranked results, rebuilt from your saved votes. If this
+    // browser has no finished ranking for the set, there's nothing to show, so
+    // fall through to the test (and fix the URL) rather than 404 into a blank.
+    if (view === "ranking") {
+      const haveRanking = state && state.done && state.ranking && hasSameFiles(state);
+      if (haveRanking) {
+        els.headerSub.textContent = folder;
+        const ranked = state.ranking.map(fn => makeItem(folder, fn));
+        showResults(ranked, { scores: state.scores });
+        return;
+      }
+      // no ranking here → drop the stale view param and take the test
+      syncUrl(folder, "compare");
+    }
+
     const sameFiles = state && state.files && state.files.length === files.length &&
       state.files.slice().sort().join("|") === files.slice().sort().join("|");
     if (!sameFiles) {
@@ -1701,7 +1725,7 @@ function showResults(items, opts) {
   renderExplain(isRanked, items);
 
   show("results");
-  syncUrl(currentFolder, "results");
+  syncUrl(currentFolder, isRanked ? "ranking" : "listen");
 }
 
 // Render the transparency table: for each track, the head-to-head record behind
@@ -1846,7 +1870,9 @@ document.getElementById("shareTestFromResults").addEventListener("click", (e) =>
   if (currentFolder) copyShareLink(e.currentTarget, currentFolder, "compare");
 });
 document.getElementById("shareResults").addEventListener("click", (e) => {
-  if (currentFolder) copyShareLink(e.currentTarget, currentFolder, "results");
+  // a shareable listen link — resolves for anyone (a "ranking" link only works
+  // in a browser that has the votes).
+  if (currentFolder) copyShareLink(e.currentTarget, currentFolder, "listen");
 });
 
 // the header title bar also returns to the set list (when not already there)
