@@ -1113,19 +1113,30 @@ async function startSet(folder, opts) {
       return;
     }
 
-    // "Skip to results" link — a listening view with no ranking. Show every
-    // track (names revealed) so a visitor can compare without taking the test.
-    if (wantResults) {
-      els.headerSub.textContent = folder;
-      const items = files.map(fn => makeItem(folder, fn));
-      showResults(items, { ranked: false });
-      return;
-    }
-
     // Load saved progress. Keep the saved vote log if it's for the same set of
     // files; otherwise start fresh. (Vote keys are folder::filename, so a changed
     // file list means the old log can't be trusted.)
     let state = Store.load(folder);
+
+    // "?view=results" link. If THIS browser has a finished ranking for the set,
+    // show the real RANKED results (with the "Why this ranking?" table) — a
+    // reload after finishing should not drop you into the rank-less listen view.
+    // Only when there's no local ranking (e.g. a shared link opened by someone
+    // who never took the test) do we fall back to the neutral listen view.
+    if (wantResults) {
+      const haveRanking = state && state.done && state.ranking &&
+        state.files && state.files.slice().sort().join("|") === files.slice().sort().join("|");
+      els.headerSub.textContent = folder;
+      if (haveRanking) {
+        currentFolder = folder;
+        const ranked = state.ranking.map(fn => makeItem(folder, fn));
+        showResults(ranked, { scores: state.scores });
+      } else {
+        const items = files.map(fn => makeItem(folder, fn));
+        showResults(items, { ranked: false });
+      }
+      return;
+    }
     const sameFiles = state && state.files && state.files.length === files.length &&
       state.files.slice().sort().join("|") === files.slice().sort().join("|");
     if (!sameFiles) {
