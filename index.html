@@ -91,17 +91,14 @@
     border-radius: 5px;
     background: linear-gradient(90deg, var(--accent), var(--wave-b));
   }
+  /* round dots — one per round (≥3), positioned dynamically in JS. A dot lights
+     once that round is complete (the fill has reached/passed it). */
   .progress-bar.precision .mark {
     position: absolute; top: 50%; width: 12px; height: 12px; border-radius: 50%;
     transform: translate(-50%, -50%); background: var(--panel);
     border: 2px solid var(--border); transition: border-color .25s, background .25s;
   }
-  .progress-bar.precision .m-good   { left: 33.33%; }
-  .progress-bar.precision .m-better { left: 66.66%; }
-  .progress-bar.precision .m-best   { left: 100%; }
-  .progress-bar.precision.lit-good   .m-good,
-  .progress-bar.precision.lit-better .m-better,
-  .progress-bar.precision.lit-best   .m-best {
+  .progress-bar.precision .mark.lit {
     background: var(--wave-b); border-color: var(--wave-b);
   }
 
@@ -321,12 +318,14 @@
   }
   .ex-name { font-weight: 700; font-size: 15px; }
   .ex-rec { font-size: 12px; margin-left: auto; }
-  .ex-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  /* fixed layout so every card's columns line up identically, regardless of how
+     long the opponent names are. The name column flexes; the rest are fixed. */
+  .ex-table { width: 100%; border-collapse: collapse; font-size: 13px; table-layout: fixed; }
   .ex-table td { padding: 4px 8px; border-top: 1px solid rgba(255,255,255,.05); vertical-align: middle; }
-  .ex-vs { white-space: nowrap; }
-  .ex-score { font-variant-numeric: tabular-nums; font-weight: 700; white-space: nowrap; }
-  .ex-outcome { color: var(--muted); }
-  .ex-contrib { text-align: right; font-variant-numeric: tabular-nums; font-weight: 700; white-space: nowrap; }
+  .ex-vs { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .ex-score { width: 64px; font-variant-numeric: tabular-nums; font-weight: 700; white-space: nowrap; text-align: center; }
+  .ex-outcome { width: 170px; color: var(--muted); }
+  .ex-contrib { width: 72px; text-align: right; font-variant-numeric: tabular-nums; font-weight: 700; white-space: nowrap; }
   .ex-pos { color: #46d39a; }
   .ex-neg { color: var(--accent-2); }
   .ex-zero { color: var(--muted); }
@@ -337,13 +336,14 @@
   .ex-table tr.ex-total td { border-top: 2px solid var(--border); padding-top: 7px; }
   .ex-legend { font-size: 12px; margin-top: 14px; line-height: 1.5; }
   @media (max-width: 600px) {
-    .ex-outcome { display: none; }   /* drop the wordy column on small screens */
+    .ex-outcome { display: none; width: 0; }   /* drop the wordy column on small screens */
     .ex-table { font-size: 12px; }
   }
 
   /* status readout under the bar */
   .sl-votes { color: var(--text); font-weight: 600; }
   .sl-ready { color: var(--wave-b); font-weight: 700; }
+  .sl-round { color: var(--accent); font-weight: 600; }
   .sl-tier  { color: var(--accent); font-weight: 600; }
   .sl-dot   { opacity: .5; }
   .sl-rem   { white-space: nowrap; }
@@ -403,13 +403,12 @@
         <strong id="compareTitle"></strong>
         <span class="muted compare-count" id="compareCount"></span>
       </div>
-      <div class="progress-bar precision">
+      <!-- Bar = round-robin progress. One dot per round (≥3); each completed
+           round fills 1/N. Dots are rendered dynamically by updatePrecision(). -->
+      <div class="progress-bar precision" id="precisionBar">
         <div class="progress-fill" id="progressFill"></div>
-        <span class="mark m-good"  title="good"></span>
-        <span class="mark m-better" title="better"></span>
-        <span class="mark m-best"  title="best"></span>
       </div>
-      <p class="muted compare-help" style="margin-top:0">Play, then tap between A and B to compare. Pick the one you prefer. The bar fills as your ranking settles — stop anytime, or keep going to raise confidence.</p>
+      <p class="muted compare-help" style="margin-top:0">Play, then tap between A and B to compare. Pick the one you prefer. Each dot is one full round (every pair compared once) — do as many as you like.</p>
 
       <div class="vs-wrap" id="vsWrap"></div>
 
@@ -1182,6 +1181,7 @@ async function startSet(folder, opts) {
     const items = files.map(fn => makeItem(folder, fn));
     rater = new PreferenceRater(items);
     _lastRemaining = null;               // don't flash a delta carried over from another set
+    _lastDotCount = -1;                  // force the round dots to rebuild for this set
     rater.replay(state.votes || []);     // rebuild ratings from the saved log
     state.done = false;                  // re-entering the loop reopens the set
     // record each new vote into the log and persist immediately
@@ -1281,24 +1281,21 @@ const TIER_LABEL = {
 // Describe the current status as { lead, remaining, tail } parts. The vote count
 // (lead) is ALWAYS shown — it's interesting info the user wants visible. The
 // `remaining` number gets its own element so we can animate it when it changes.
-// BLIND TEST: never name a track here; describe the STATE only. Names are
-// revealed only on the results screen.
-//   before ranking:  lead="12 votes"  remaining=3  tail="to a ranking"
-//   ranking ready:    lead="14 votes"  tail="Ranking ready ✓ · Confident"
-//                     (+ remaining=5 tail2="to firmer confidence" if not settled)
+// BLIND TEST: never name a track here; describe the STATE only.
+// The bar now tracks ROUND-ROBIN progress, so the readout counts down votes to
+// finish the current round. Vote count is always shown.
+//   "12 votes · Round 2 · +5 to finish this round"
+//   once a round completes & a ranking exists: "· Ranking ready ✓"
 function statusParts(s, voteCount) {
   const lead = voteCount + (voteCount === 1 ? " vote" : " votes");
-  const tier = TIER_LABEL[s.tier] || s.tier;
-  if (!s.preliminary) {
-    // counting down to a usable ranking
-    const tail = s.topIsTie ? "to break the tie up top" : s.nextLabel; // "to a ranking"
-    return { lead, remaining: s.votesToNext, tail };
-  }
-  // ranking is ready — say so for certain
-  if (s.votesToNext > 0) {
-    return { lead, ready: true, remaining: s.votesToNext, tail: "to firmer confidence", tier };
-  }
-  return { lead, ready: true, remaining: 0, tail: "fully settled", tier };
+  const round = `Round ${s.currentRound}`;
+  return {
+    lead,
+    round,
+    remaining: s.votesToRound,           // votes to finish the current round
+    tail: "to finish this round",
+    ready: s.complete,                   // at least one full round-robin done
+  };
 }
 
 // remember the last remaining-count so we can flash the delta (−1 / +2) on change
@@ -1313,13 +1310,10 @@ function updatePrecision() {
   const p = statusParts(s, rater.voteCount);
   renderStatusLine(p);
 
-  // bar markers: good = ranking ready, better = stop-ok, best = fully+confident.
-  const bar = document.querySelector(".progress-bar.precision");
-  if (bar) {
-    bar.classList.toggle("lit-good",   s.winnerLocked);
-    bar.classList.toggle("lit-better", s.stopOk);
-    bar.classList.toggle("lit-best",   s.phase === 3 && s.tier === "rock-solid");
-  }
+  // round dots: one per round (≥3, grows as you start more). A dot lights once
+  // that round is complete. Rebuilt only when the dot COUNT changes, so we don't
+  // thrash the DOM every vote.
+  renderRoundDots(s.dots, s.roundsComplete);
 
   // tell the "Show results" button whether the ranking is ready (and how many
   // votes remain if not), so it can disable + show "(need X more)".
@@ -1335,13 +1329,9 @@ function renderStatusLine(p) {
   if (!el) return;
   const parts = [];
   parts.push(`<span class="sl-votes">${p.lead}</span>`);
-  if (p.ready) {
-    parts.push(`<span class="sl-ready">Ranking ready ✓</span>`);
-    if (p.tier) parts.push(`<span class="sl-tier">${p.tier}</span>`);
-    if (p.remaining > 0) {
-      parts.push(`<span class="sl-rem">+<span class="sl-num">${p.remaining}</span> ${p.tail}</span>`);
-    }
-  } else {
+  if (p.ready) parts.push(`<span class="sl-ready">Ranking ready ✓</span>`);
+  parts.push(`<span class="sl-round">${p.round}</span>`);
+  if (p.remaining > 0) {
     parts.push(`<span class="sl-rem">+<span class="sl-num">${p.remaining}</span> ${p.tail}</span>`);
   }
   el.innerHTML = parts.join(' <span class="sl-dot">·</span> ');
@@ -1353,6 +1343,30 @@ function renderStatusLine(p) {
     flashDelta(el.querySelector(".sl-num"), delta);
   }
   _lastRemaining = cur;
+}
+
+// Render the round dots on the bar: `dots` evenly spaced markers; the first
+// `lit` of them light up (one per completed round). Rebuild only when the count
+// changes (avoid DOM thrash every vote).
+let _lastDotCount = -1;
+function renderRoundDots(dots, lit) {
+  const bar = document.getElementById("precisionBar");
+  if (!bar) return;
+  if (dots !== _lastDotCount) {
+    // remove old dots (keep the fill div)
+    bar.querySelectorAll(".mark").forEach(m => m.remove());
+    for (let k = 1; k <= dots; k++) {
+      const m = document.createElement("span");
+      m.className = "mark";
+      m.style.left = (100 * k / dots) + "%";
+      m.dataset.idx = k;
+      bar.appendChild(m);
+    }
+    _lastDotCount = dots;
+  }
+  bar.querySelectorAll(".mark").forEach(m => {
+    m.classList.toggle("lit", Number(m.dataset.idx) <= lit);
+  });
 }
 
 // Pop a small "-1" / "+2" bubble next to the number and let CSS animate it.

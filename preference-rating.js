@@ -497,10 +497,12 @@
       // gather pair states
       let unseen = 0, provisional = 0, settled = 0, total = 0;
       let provisionalNeed = 0;     // extra meetings to bring provisionals to floor
+      let minGames = Infinity;
       for (let i = 0; i < n; i++) {
         for (let j = i + 1; j < n; j++) {
           const ps = this.pairState(i, j);
           total++;
+          minGames = Math.min(minGames, ps.games);
           if (ps.state === "unseen") unseen++;
           else if (ps.state === "provisional") {
             provisional++;
@@ -508,7 +510,26 @@
           } else settled++;
         }
       }
+      if (!isFinite(minGames)) minGames = 0;
       const complete = unseen === 0;
+
+      // ---- round-robin progress (drives the bar) -------------------------
+      // Because matchmaking always serves the LEAST-played pair, coverage is even:
+      // a "round" is one full pass (every pair played once). roundsComplete = the
+      // fewest games any pair has; the pairs already at minGames+1 are how far into
+      // the current round we are. The bar fills 1/3 per completed round, with a dot
+      // per round and a 4th+ dot added if you keep going.
+      let roundsComplete = minGames;
+      let aheadCount = 0;                       // pairs already into the next round
+      for (let i = 0; i < n; i++)
+        for (let j = i + 1; j < n; j++)
+          if (this.games[i][j] > minGames) aheadCount++;
+      const roundProgress = total ? aheadCount / total : 0;   // 0..1 through current round
+      // total dots: at least 3, grows as you start more rounds
+      const roundsStarted = roundsComplete + (aheadCount > 0 ? 1 : 0);
+      const dots = Math.max(3, roundsStarted || (complete ? 1 : 0) + (roundProgress > 0 ? 1 : 0));
+      // bar fill: each completed round is 1/dots; the current round adds a fraction.
+      const roundFill = dots > 0 ? (roundsComplete + roundProgress) / dots : 0;
 
       const rows = this.ranking();
 
@@ -582,27 +603,20 @@
         competence = Math.min(competence, sure);
       }
 
-      // ---- phase + fill --------------------------------------------------
+      // ---- the bar: simple round-robin progress --------------------------
+      // No phase magic. The bar IS how far through the round-robins you are:
+      // 1/3 per completed round (≥3 dots), the current round adding a fraction.
+      // It only moves forward and maps exactly to the real work being done.
+      const fill = Math.min(1, roundFill);
+
+      // `phase`/`allSettled` are kept ONLY for the status text + button gate
+      // (they don't drive the bar anymore).
       const allSettled = unseen === 0 && provisional === 0;
       let phase;
-      if (!winnerLocked) phase = 1;
+      if (!complete) phase = 0;
+      else if (!winnerLocked) phase = 1;
       else if (!allSettled) phase = 2;
       else phase = 3;
-
-      // bar fill maps to the three markers at 1/3, 2/3, 1 (which light up as
-      // good=winner-locked, better=stop-ok, best=rock-solid). Each phase fills
-      // its own third and STAYS within it, so the fill never crosses a marker
-      // the phase hasn't reached:
-      //   phase 1 = 0 .. 1/3  by coverage toward the winner lock
-      //   phase 2 = 1/3 .. 2/3 by fraction of pairs settled
-      //   phase 3 = 2/3 .. 1   by competence
-      let fill;
-      const coverage = total ? (total - unseen) / total : 1;
-      const settledFrac = total ? settled / total : 1;
-      const T1 = 1 / 3, T2 = 2 / 3;
-      if (phase === 1)      fill = T1 * 0.92 * coverage;   // capped just below the first marker
-      else if (phase === 2) fill = T1 + (T2 - T1) * settledFrac;
-      else                  fill = T2 + (1 - T2) * competence;
 
       // ---- tier ----------------------------------------------------------
       let tier;
@@ -636,12 +650,19 @@
         nextLabel = "fully settled";
       }
 
+      // votes remaining to FINISH the current round-robin (each pair not yet at
+      // minGames+1 needs one vote). This is what the round bar counts down.
+      const votesToRound = total - aheadCount;
+
       return {
         complete, phase, winnerLocked, winners, topIsTie,
         preliminary, tieContenders,
         competence, tier, fill,
         stopOk: preliminary,            // can view results for certain once true
         votesToNext, nextLabel,
+        // round-robin progress (drives the bar + dots)
+        roundsComplete, roundProgress, roundsStarted, dots, votesToRound,
+        currentRound: roundsComplete + 1,
         counts: { unseen, provisional, settled, total },
       };
     }
@@ -737,7 +758,7 @@
       ok(rk.every(r => r.score === 0), "no votes ⇒ all scores 0");
       const s = c.status();
       ok(!s.complete, "no votes ⇒ not complete");
-      ok(s.phase === 1, "no votes ⇒ phase 1");
+      ok(s.phase === 0, "no votes ⇒ phase 0 (first sweep not done)");
       approx(s.fill, 0, 1e-9, "no votes ⇒ empty bar");
     })();
 
@@ -848,22 +869,26 @@
       ok(s.winners.length === 1 && s.winners[0] === "A", "A is the sole winner");
     })();
 
-    // ---- 11. precision()/fill monotonic-ish and in [0,1] -----------------
+    // ---- 11. round-bar fill: in [0,1], 1/3 per round, only drops on expansion
     (function () {
       const c = new PreferenceCore(["A", "B", "C", "D"], { rng: makeRng(5) });
       const order = { A: 4, B: 3, C: 2, D: 1 };
-      let prev = 0, ok01 = true, neverWild = true;
+      let prev = 0, ok01 = true, monotoneWithinDots = true, prevDots = 3;
       for (let t = 0; t < 60; t++) {
         const [x, y] = c.nextPair();
         c.vote(x, y, order[x] > order[y] ? x : y);
-        const f = c.precision();
-        if (f < 0 || f > 1) ok01 = false;
-        if (f < prev - 0.2) neverWild = false;   // no catastrophic wipe
-        prev = f;
+        const s = c.status();
+        if (s.fill < 0 || s.fill > 1) ok01 = false;
+        // fill only ever decreases when the dot count GROWS (a new round began,
+        // rescaling the bar) — never within a fixed dot count.
+        if (s.dots === prevDots && s.fill < prev - 1e-9) monotoneWithinDots = false;
+        prev = s.fill; prevDots = s.dots;
       }
-      ok(ok01, "fill stays within [0,1]");
-      ok(neverWild, "fill never wipes (no >0.2 single drop)");
-      ok(c.precision() > 0.8, "consistent voter ends high");
+      ok(ok01, "round fill stays within [0,1]");
+      ok(monotoneWithinDots, "round fill never retreats within a fixed dot count");
+      // after a full round-robin (every pair ≥1), fill is at least 1/3.
+      const s = c.status();
+      ok(s.complete && s.fill >= 1 / 3 - 1e-9, "first full round ⇒ bar at least at 1st marker");
     })();
 
     // ---- 12. nextPair valid, distinct, prefers unseen then provisional ---
