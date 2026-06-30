@@ -179,6 +179,7 @@
   /* rating readout under the rank pill on the results screen */
   .score { font-size: 13px; font-weight: 700; font-variant-numeric: tabular-nums; color: var(--text); }
   .score-pm { font-size: 10px; font-weight: 600; color: var(--muted); margin-left: 1px; }
+  .score-lbl { font-size: 9px; font-weight: 600; color: var(--muted); display: block; line-height: 1; margin-top: 1px; }
   .tie-note {
     font-size: 11px; font-weight: 700; color: var(--accent-2);
     border: 1px solid var(--accent-2); border-radius: 5px; padding: 0 5px; margin-left: 6px;
@@ -1657,8 +1658,11 @@ function showResults(items, opts) {
     // snapshot lacks the vote totals.
     const won = sc && sc.votesWon != null ? sc.votesWon : (sc ? sc.wins : 0);
     const tot = sc && sc.votesTotal != null ? sc.votesTotal : null;
+    // "won 5 of the 5 times you compared it" — label it so the bare fraction
+    // isn't mistaken for a rank or a matchup count. (See the "Why this ranking?"
+    // table below for the full per-opponent breakdown.)
     const scoreHTML = (isRanked && sc && tot)
-      ? `<span class="score" title="times you preferred this track">${won}/${tot}</span>`
+      ? `<span class="score" title="how many of your A/B picks went to this track, out of the times it appeared">${won}/${tot}<span class="score-lbl"> picks</span></span>`
       : "";
     // tie note when this track shares its cluster rank with a neighbor.
     const tieNote = (isRanked && sc && sc.tied)
