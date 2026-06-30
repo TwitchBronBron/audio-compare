@@ -1065,7 +1065,17 @@ class PreferenceRater {
     this._running = true;
     return new Promise((resolve) => {
       this._resolveDone = resolve;
-      this._serveNext();
+      // If we resume EXACTLY on a round boundary (e.g. a page reload right after
+      // the vote that completed a round), show the round-complete modal first —
+      // same as the live path — so the user still gets the view/continue choice
+      // instead of being dropped straight back into voting.
+      const s = this.core.status();
+      if (s.roundJustDone) {
+        updatePrecision();
+        onRoundComplete(s, () => { if (this._running) this._serveNext(); });
+      } else {
+        this._serveNext();
+      }
     });
   }
 
