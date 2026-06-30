@@ -305,8 +305,9 @@
   .muted { color: var(--muted); }
   .err { color: #ff6b6b; }
 
-  /* breadcrumb trail at the top of a card */
-  .crumbs { margin: -4px 0 12px; }
+  /* breadcrumb trail at the top of a card — sits tight to the top edge and
+     close above the heading. */
+  .crumbs { margin: -8px 0 2px; }
   .crumb-link {
     background: none; border: none; padding: 2px 0; margin: 0;
     color: var(--muted); font: inherit; font-size: 13px; cursor: pointer;
@@ -469,13 +470,7 @@
   <section id="step-results" class="hidden">
     <div class="card">
       <nav class="crumbs"><button class="crumb-link" id="resultsCrumbHome">← All sets</button></nav>
-      <h2 style="margin-top:0;" id="resultsHeading">Final ranking</h2>
-
-      <!-- Primary actions up top: keep refining is the main next step. -->
-      <div class="toolbar" style="margin:4px 0 14px;">
-        <button class="primary" id="resultsStartOver">➕ Keep refining</button>
-        <button class="ghost" id="resultsRestartScratch">↺ Rank again from scratch</button>
-      </div>
+      <h2 style="margin-top:0;" id="resultsHeading">Results</h2>
 
       <p class="muted" id="resultsBlurb">Ranked highest to lowest. “≈” indicates a tie.</p>
 
@@ -492,6 +487,12 @@
           <span><kbd>↑</kbd><kbd>↓</kbd> switch track</span>
           <span><kbd>←</kbd><kbd>→</kbd> jump 2s</span>
         </div>
+      </div>
+
+      <!-- Primary actions: below the player, above the deep-dive table. -->
+      <div class="toolbar" style="margin-top:18px;">
+        <button class="primary" id="resultsStartOver">➕ Keep refining</button>
+        <button class="ghost" id="resultsRestartScratch">↺ Rank again from scratch</button>
       </div>
 
       <!-- Why this ranking? A transparent breakdown of every head-to-head and
@@ -1745,19 +1746,8 @@ function showResults(items, opts) {
   els.headerSub.textContent = currentFolder + (isRanked ? " — ranked!" : "");
   els.resultsLanes.innerHTML = "";
 
-  // headings + which share button is relevant for this mode. When we have score
-  // data, announce the winner (or co-winners) right in the heading.
-  const scoreMap = (opts && opts.scores) || null;
-  let heading = isRanked ? "Final ranking" : "Listen & compare";
-  if (isRanked && scoreMap) {
-    const winners = items.filter(it => scoreMap[it.file] && scoreMap[it.file].rank === 1);
-    if (winners.length === 1) {
-      heading = "🏆 " + (winners[0].name || winners[0].file.replace(/\.[^.]+$/, ""));
-    } else if (winners.length > 1) {
-      heading = "🏆 Tied: " + winners.map(w => w.name || w.file.replace(/\.[^.]+$/, "")).join(" & ");
-    }
-  }
-  document.getElementById("resultsHeading").textContent = heading;
+  // static section heading (the winner is shown by the #1 lane, not the title).
+  document.getElementById("resultsHeading").textContent = isRanked ? "Results" : "Listen & compare";
   document.getElementById("resultsBlurb").textContent = isRanked
     ? "Ranked highest to lowest. “≈” indicates a tie."
     : "All tracks in this set — click to listen.";
