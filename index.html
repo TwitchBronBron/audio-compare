@@ -177,6 +177,21 @@
   .score { font-size: 13px; font-weight: 700; font-variant-numeric: tabular-nums; color: var(--text); }
   .score-pm { font-size: 10px; font-weight: 600; color: var(--muted); margin-left: 1px; }
   .score-lbl { font-size: 9px; font-weight: 600; color: var(--muted); display: block; line-height: 1; margin-top: 1px; }
+  /* the picks readout is a button that opens the per-track breakdown */
+  .score-btn {
+    background: transparent; border: 0; padding: 2px; margin: 0; cursor: pointer;
+    color: var(--text); text-align: center; border-radius: 6px; line-height: 1.15;
+  }
+  .score-btn:hover { background: var(--panel-2); }
+  .score-why { font-size: 9px; font-weight: 700; color: var(--accent); display: block; line-height: 1; margin-top: 2px; }
+  /* step-by-step breakdown modal content */
+  .brk-step { margin: 0 0 16px; }
+  .brk-step h4 { margin: 0 0 6px; font-size: 13px; color: var(--accent); font-weight: 700; }
+  .brk-step:last-of-type { margin-bottom: 0; }
+  .brk-lead { font-size: 14px; margin: 0 0 18px; color: var(--text); }
+  .brk-lead .brk-rank { font-weight: 800; color: var(--accent); }
+  .brk-final { margin-top: 18px; padding-top: 12px; border-top: 2px solid var(--border); font-size: 14px; }
+  .brk-final strong { color: var(--accent); }
   .tie-note {
     font-size: 11px; font-weight: 700; color: var(--accent-2);
     border: 1px solid var(--accent-2); border-radius: 5px; padding: 0 5px; margin-left: 6px;
@@ -207,6 +222,33 @@
   .debug-panel tr.is-tie td { color: var(--accent-2); }
   .debug-panel tr.low-gate td { opacity: .5; }
   .debug-panel .dbg-warn { color: #ff8080; font-weight: 700; }
+
+  /* header debug toggle — small, unobtrusive, pushed to the right */
+  .debug-toggle {
+    margin-left: auto; font-size: 12px; padding: 4px 10px;
+    background: transparent; border: 1px solid var(--border); color: var(--muted);
+    border-radius: 6px; cursor: pointer; align-self: center;
+  }
+  .debug-toggle:hover { border-color: var(--accent-2); color: var(--text); }
+  .debug-toggle.on { border-color: var(--accent-2); color: var(--accent-2); font-weight: 700; }
+
+  /* shared modal: dimmed overlay + centered card. Used by the debug-mode
+     confirmation and the per-track "how it ranked" breakdown. */
+  .modal-overlay {
+    position: fixed; inset: 0; z-index: 1000;
+    background: rgba(0,0,0,.6); display: grid; place-items: center;
+    padding: 20px; animation: modalFade .12s ease-out;
+  }
+  @keyframes modalFade { from { opacity: 0; } to { opacity: 1; } }
+  .modal-card {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+    padding: 22px 24px; max-width: 560px; width: 100%;
+    max-height: 85vh; overflow-y: auto; text-align: left;
+    box-shadow: 0 16px 48px rgba(0,0,0,.5);
+  }
+  .modal-card h3 { margin: 0 0 12px; font-size: 18px; }
+  .modal-actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 20px; flex-wrap: wrap; }
+  .rc-ties { color: var(--accent-2); font-weight: 600; margin: 12px 0 0; }
 
   /* shared transport bar under the lanes */
   /* transport + keyboard hints: side by side on desktop, stacked on mobile */
@@ -402,6 +444,7 @@
 <header>
   <h1>🎧 Audio Comparison</h1>
   <span class="sub" id="headerSub">Pick a set to start ranking</span>
+  <button class="debug-toggle" id="debugToggle" type="button" title="Reveal answers while voting (for testing)">Debug</button>
 </header>
 
 <main>
@@ -524,9 +567,15 @@
  * ------------------------------------------------------------------ */
 const AUDIO_ROOT = "audio/";
 
-// ?debug=true reveals the real track names during comparisons (to verify the
-// parenthetical "answer" is being hidden correctly). Off by default.
-const DEBUG = /[?&]debug=true\b/.test(location.search);
+// Debug mode reveals the real track names + the live rating-engine internals
+// during comparisons (to verify the blind test is hiding the "answer"). Off by
+// default. Persisted in localStorage and toggled from the header button — the
+// old ?debug=true querystring still enables it (legacy), but the router rewrites
+// the URL to a hashbang, so the querystring gets clobbered; localStorage is the
+// durable home for the choice.
+const DEBUG_KEY = "audiocompare:debug";
+let DEBUG = localStorage.getItem(DEBUG_KEY) === "1"
+         || /[?&]debug=true\b/.test(location.search);
 
 // color palette for lanes. Colors are randomized every run so nobody can
 // remember "A was blue last time" — the mapping carries no information.
@@ -539,6 +588,108 @@ function shuffled(arr) {
     [a[i], a[j]] = [a[j], a[i]];
   }
   return a;
+}
+
+/* ------------------------------------------------------------------ *
+ * Shared modal — dimmed overlay + card. innerHTML is the caller's; close
+ * on Esc, on backdrop click, or on any [data-close] element inside.
+ * Returns a close() fn. Only one modal at a time (a new one closes the old).
+ * ------------------------------------------------------------------ */
+let _openModalClose = null;
+function openModal(innerHTML) {
+  if (_openModalClose) _openModalClose();
+  const overlay = document.createElement("div");
+  overlay.className = "modal-overlay";
+  overlay.innerHTML = `<div class="modal-card" role="dialog" aria-modal="true">${innerHTML}</div>`;
+  function close() {
+    document.removeEventListener("keydown", onKey);
+    overlay.remove();
+    if (_openModalClose === close) _openModalClose = null;
+  }
+  function onKey(e) { if (e.key === "Escape") close(); }
+  overlay.addEventListener("mousedown", (e) => { if (e.target === overlay) close(); });
+  overlay.addEventListener("click", (e) => {
+    if (e.target.closest("[data-close]")) close();
+  });
+  document.addEventListener("keydown", onKey);
+  document.body.appendChild(overlay);
+  _openModalClose = close;
+  return close;
+}
+
+// Ordinal helper for tie wording ("2nd", "3rd"…).
+function ordinal(n) {
+  const s = ["th", "st", "nd", "rd"], v = n % 100;
+  return n + (s[(v - 20) % 10] || s[v] || s[0]);
+}
+
+// Round-complete modal: a full round-robin just finished, so a fair ranking now
+// exists. Offer "view results" or "keep voting", and flag any ties (a tie means
+// the order isn't settled — a nudge to keep going). `onContinue` resumes voting.
+function onRoundComplete(s, onContinue) {
+  // phrase ties: "a 3-way tie for 2nd place" etc. (only the rank, not the names —
+  // names stay hidden until results; this is still the blind voting screen).
+  let tieLine = "";
+  if (s.hasTies) {
+    const bits = s.ties.map(t => {
+      const size = t.keys.length;
+      const word = size === 2 ? "2-way" : size === 3 ? "3-way" : size + "-way";
+      return `a ${word} tie for ${ordinal(t.rank)} place`;
+    });
+    tieLine = `<p class="rc-ties">⚠ There's ${bits.join(", and ")} — vote more to break ${s.ties.length > 1 ? "them" : "it"}.</p>`;
+  }
+  openModal(`
+    <h3>Round ${s.roundsComplete} complete 🎉</h3>
+    <p>Every track has now been compared to every other track ${s.roundsComplete === 1 ? "once" : s.roundsComplete + " times"} —
+       so your ranking is ready to view. Keep voting for more rounds to firm it up.</p>
+    ${tieLine}
+    <div class="modal-actions">
+      <button class="ghost" type="button" id="rcContinue">Vote more</button>
+      <button class="primary" type="button" id="rcView">View results</button>
+    </div>`);
+  document.getElementById("rcContinue").addEventListener("click", () => {
+    if (_openModalClose) _openModalClose();
+    onContinue();
+  });
+  document.getElementById("rcView").addEventListener("click", () => {
+    if (_openModalClose) _openModalClose();
+    if (rater) rater.finish();   // ends the vote loop → shows results
+  });
+}
+
+/* ------------------------------------------------------------------ *
+ * Debug-mode toggle (header button). Enabling asks for confirmation (it
+ * reveals the answers); the choice is persisted to localStorage. Disabling
+ * is immediate. Either way we re-render so the current screen reflects it.
+ * ------------------------------------------------------------------ */
+function syncDebugToggle() {
+  const btn = document.getElementById("debugToggle");
+  if (!btn) return;
+  btn.classList.toggle("on", DEBUG);
+  btn.textContent = DEBUG ? "Debug: ON" : "Debug";
+}
+function setDebug(on) {
+  DEBUG = on;
+  if (on) localStorage.setItem(DEBUG_KEY, "1");
+  else localStorage.removeItem(DEBUG_KEY);
+  syncDebugToggle();
+  // re-render whatever's showing so names/panel appear or vanish immediately
+  Router.handle();
+}
+function onDebugToggleClick() {
+  if (DEBUG) { setDebug(false); return; }       // turning OFF is immediate
+  openModal(`
+    <h3>Enable debug mode?</h3>
+    <p>This will show you <strong>all the answers</strong> (the real track names)
+       as you vote — useful for testing, but it breaks the blind test.</p>
+    <div class="modal-actions">
+      <button class="ghost" type="button" data-close>Cancel</button>
+      <button class="primary" type="button" id="debugConfirm">Enable debug mode</button>
+    </div>`);
+  document.getElementById("debugConfirm").addEventListener("click", () => {
+    if (_openModalClose) _openModalClose();
+    setDebug(true);
+  });
 }
 
 // strip anything inside parentheses (the hidden "answer") + extension
@@ -878,20 +1029,14 @@ function setupWaveform(track, canvas, color, getKey) {
  *
  * `PreferenceRater` mirrors the small surface the rest of this file uses:
  *   .replay(log) .record(cb) .run() .finish() .ranking() .precision() .status() .voteCount
- * and re-exports the core's constants (MEET_FLOOR/DECIDE_FRAC/WIN_MARGIN).
  *
  * ranking() rows here carry the full {item} object (the UI needs name/url),
- * layered on top of the core's {key, theta, se, r, rd, lo, hi}.
+ * layered on top of the core's {key, score, wins, losses, rank, tied, ...}.
  */
 
 const PreferenceCore = window.PreferenceCore;
 
 class PreferenceRater {
-  // re-export the core's constants for the UI.
-  static get MEET_FLOOR() { return PreferenceCore.MEET_FLOOR; }
-  static get DECIDE_FRAC() { return PreferenceCore.DECIDE_FRAC; }
-  static get WIN_MARGIN() { return PreferenceCore.WIN_MARGIN; }
-
   constructor(items) {
     this.items = items;                       // [{file, name, key, url}]
     this.itemByKey = new Map(items.map(it => [it.key, it]));
@@ -941,7 +1086,16 @@ class PreferenceRater {
       this.core.vote(a.key, b.key, winner.key);
       if (this.record) this.record(a.key, b.key, winner.key);
       this.pending = null;
-      if (this._running) this._serveNext();
+      if (!this._running) return;
+      // A full round-robin just completed → pause and let the user choose to view
+      // results or keep voting (we can only rank fairly on a complete round).
+      const s = this.core.status();
+      if (s.roundJustDone) {
+        updatePrecision();
+        onRoundComplete(s, () => { if (this._running) this._serveNext(); });
+        return;
+      }
+      this._serveNext();
     });
   }
 }
@@ -1022,6 +1176,7 @@ function onTransportTick() {
 }
 let currentFolder = null;
 let rater = null;
+let resultsItems = null;   // items shown on the current ranked results screen (for the breakdown modal)
 
 function show(step) {
   els.stepSelect.classList.toggle("hidden", step !== "select");
@@ -1268,7 +1423,7 @@ async function startSet(folder, opts) {
     state.scores = {};
     for (const row of rk) {
       state.scores[row.item.file] = {
-        r: row.r, score: row.score, rank: row.rank, tied: row.tied,
+        score: row.score, rank: row.rank, tied: row.tied,
         wins: row.wins, losses: row.losses,
         votesWon: row.votesWon, votesTotal: row.votesTotal,
       };
@@ -1363,8 +1518,8 @@ const TIER_LABEL = {
 function statusParts(s, voteCount) {
   const lead = voteCount + (voteCount === 1 ? " vote" : " votes");
   const tier = TIER_LABEL[s.tier] || s.tier;
-  // state 1: first round-robin not done yet
-  if (!s.complete) {
+  // state 1: first round-robin not done yet (no ranking can exist mid-cycle)
+  if (!s.ready) {
     return { lead, remaining: s.votesToRound, tail: "to your first ranking" };
   }
   // a round is "in progress" only once at least one pair is into the next round
@@ -1400,6 +1555,7 @@ function updatePrecision() {
   updateResultsButton(s);
 
   if (DEBUG) renderDebug();
+  else document.getElementById("debugPanel").classList.add("hidden");
 }
 
 // Render the status readout into #compareCount, with the remaining-count in its
@@ -1461,27 +1617,21 @@ function flashDelta(numEl, delta) {
   setTimeout(() => { if (b.parentNode) b.parentNode.removeChild(b); }, 900);
 }
 
-// Reflect "ranking ready / need X more" on the Show-results button.
+// Reflect "ranking ready / need X more" on the Show-results button. A ranking by
+// win count is only fair once a FULL round-robin is done (equal games for all),
+// so the button is hard-disabled until the first round completes.
 function updateResultsButton(s) {
   const btn = document.getElementById("finishRanking");
   if (!btn) return;
-  if (!s.complete) {
-    // Hard-disabled until a full round-robin sweep is done (every pair compared
-    // at least once). Before that there's no real ranking to show.
-    const n = s.counts ? s.counts.unseen : s.votesToNext;
+  if (!s.ready) {
     btn.disabled = true;
     btn.classList.remove("ready");
+    const n = s.votesToRound;
     btn.textContent = `Show results (${n} more to finish the first round)`;
-  } else if (s.preliminary) {
+  } else {
     btn.disabled = false;
     btn.classList.add("ready");
     btn.textContent = "✓ Show results";
-  } else {
-    // sweep done but the winner isn't locked yet — allow viewing, just signal it.
-    btn.disabled = false;
-    btn.classList.remove("ready");
-    const n = s.votesToNext;
-    btn.textContent = n > 0 ? `Show results (${n} more to firm it up)` : "Show results";
   }
 }
 
@@ -1504,16 +1654,14 @@ function debugSnapshot() {
       rows.push({
         a: core.keys[i], b: core.keys[j],
         games: ps.games, winsA: ps.wins, winsB: ps.loss,
-        state: ps.state,
         leader: ps.leader == null ? "—" : core.keys[ps.leader],
-        isTie: ps.state === "tied",
-        unsettled: ps.state === "unseen" || ps.state === "provisional",
+        isTie: ps.games > 0 && ps.leader == null,
+        unsettled: ps.games === 0,
       });
     }
   }
-  // sort least-settled first so problem pairs are at the top
-  const rank = { unseen: 0, provisional: 1, tied: 2, decided: 3 };
-  rows.sort((x, y) => (rank[x.state] - rank[y.state]) || (x.games - y.games));
+  // least-played pairs first (that's what nextPair will serve next)
+  rows.sort((x, y) => x.games - y.games);
   return {
     rows,
     ranking: rater.ranking(),
@@ -1541,10 +1689,10 @@ function renderDebug() {
   const pct = (x) => (100 * x).toFixed(0) + "%";
   const s = snap.status;
 
-  // ranking table — cluster rank, net matchup score, decided W–L
+  // ranking table — rank, total wins (the score), W–L
   let html = `<table><caption>ranking · bar ${pct(s.fill)} · ${TIER_LABEL[s.tier] || s.tier}` +
-             ` · phase ${s.phase} · ${snap.voteCount} votes</caption>`;
-  html += "<tr><th>#</th><th>track</th><th>score</th><th>decided W–L</th><th>tie</th></tr>";
+             ` · round ${s.roundsComplete} · ${snap.voteCount} votes</caption>`;
+  html += "<tr><th>#</th><th>track</th><th>wins (score)</th><th>W–L</th><th>tie</th></tr>";
   snap.ranking.forEach((r) => {
     html += `<tr${r.tied ? ' class="is-tie"' : ""}><td>${r.rank}</td><td>${escapeHtml(debugName(r.key))}</td>` +
             `<td>${r.score}</td><td>${r.wins}–${r.losses}</td><td>${r.tied ? "≈" : ""}</td></tr>`;
@@ -1552,12 +1700,13 @@ function renderDebug() {
   html += "</table>";
 
   // status summary
-  html += `<table><caption>status — winner ${s.winnerLocked ? "locked: " + s.winners.map(debugName).join(", ") : "not yet"}` +
-          ` · competence ${pct(s.competence)} · next: ${s.nextLabel}${s.votesToNext ? " (~" + s.votesToNext + ")" : ""}</caption></table>`;
+  const tieTxt = s.hasTies ? s.ties.map(t => `${ordinal(t.rank)}: ${t.keys.map(debugName).join("/")}`).join(", ") : "none";
+  html += `<table><caption>status — ${s.ready ? "ranking ready" : "not ready (round " + s.currentRound + " in progress)"}` +
+          ` · ties: ${escapeHtml(tieTxt)}</caption></table>`;
 
-  // per-pair table (least-settled first)
-  html += `<table><caption>pairs (least-settled first)</caption>`;
-  html += "<tr><th>pair</th><th>games</th><th>W–L</th><th>leader</th><th>state</th></tr>";
+  // per-pair table (least-played first)
+  html += `<table><caption>pairs (least-played first)</caption>`;
+  html += "<tr><th>pair</th><th>games</th><th>W–L</th><th>leader</th></tr>";
   for (const r of snap.rows) {
     const cls = [];
     if (r.isTie) cls.push("is-tie");
@@ -1565,7 +1714,7 @@ function renderDebug() {
     html += `<tr class="${cls.join(" ")}">` +
             `<td>${escapeHtml(debugName(r.a))} vs ${escapeHtml(debugName(r.b))}</td>` +
             `<td>${r.games}</td><td>${r.winsA}–${r.winsB}</td>` +
-            `<td>${escapeHtml(debugName(r.leader))}</td><td>${r.state}</td></tr>`;
+            `<td>${escapeHtml(debugName(r.leader))}</td></tr>`;
   }
   html += "</table>";
   body.innerHTML = html;
@@ -1610,38 +1759,36 @@ async function copyDebugDiagnostic() {
     log("votes rejected on replay (bad keys):", rejected);
 
     const s = core.status();
-    log("bar fill:", (100 * s.fill).toFixed(0) + "%", "| phase:", s.phase,
-        "| tier:", s.tier, "| competence:", (100 * s.competence).toFixed(0) + "%");
-    log("complete:", s.complete, "| winner locked:", s.winnerLocked,
-        s.winnerLocked ? "| winner(s): " + s.winners.map(debugName).join(", ") : "");
-    log("next:", s.nextLabel, s.votesToNext ? "(~" + s.votesToNext + " votes)" : "");
+    log("bar fill:", (100 * s.fill).toFixed(0) + "%", "| round:", s.roundsComplete,
+        "| tier:", s.tier, "| ready:", s.ready);
+    log("ties:", s.hasTies ? s.ties.map(t => ordinal(t.rank) + ": " + t.keys.map(debugName).join("/")).join(", ") : "none");
 
-    log("\n=== FINAL RANKING (clusters) ===");
+    log("\n=== FINAL RANKING (by total wins) ===");
     for (const r of core.ranking()) {
-      log(`${String(r.rank).padStart(2)}. ${debugName(r.key).padEnd(28)} score=${r.score}` +
-          ` decided ${r.wins}-${r.losses}${r.tied ? "  ≈ tied" : ""}`);
+      log(`${String(r.rank).padStart(2)}. ${debugName(r.key).padEnd(28)} wins=${r.score}` +
+          ` (${r.wins}-${r.losses})${r.tied ? "  ≈ tied" : ""}`);
     }
 
     log("\n=== PER-PAIR HEAD-TO-HEAD ===");
-    log("pair | games | W-L | leader | state");
-    const order = { unseen: 0, provisional: 1, tied: 2, decided: 3 };
+    log("pair | games | W-L | leader");
     const prs = [];
     for (let i = 0; i < core.n; i++) for (let j = i + 1; j < core.n; j++) prs.push(core.pairState(i, j));
-    prs.sort((a, b) => (order[a.state] - order[b.state]) || (a.games - b.games));
+    prs.sort((a, b) => a.games - b.games);
     for (const ps of prs) {
       log(`${debugName(core.keys[ps.i])} vs ${debugName(core.keys[ps.j])} | ${ps.games} | ` +
-          `${ps.wins}-${ps.loss} | ${ps.leader == null ? "—" : debugName(core.keys[ps.leader])} | ${ps.state}`);
+          `${ps.wins}-${ps.loss} | ${ps.leader == null ? "—" : debugName(core.keys[ps.leader])}`);
     }
 
-    // sanity: no ranking should contradict a DECIDED head-to-head
+    // informative: a ranking by total wins CAN still rank a track above one that
+    // beat it head-to-head (a preference cycle). Count those so the data shows it.
     const pos = {}; core.ranking().forEach((r, i) => pos[r.key] = i);
     let inversions = 0;
     for (const ps of prs) {
-      if (ps.state !== "decided") continue;
+      if (ps.leader == null) continue;
       const hi = core.keys[ps.leader], lo = core.keys[ps.leader === ps.i ? ps.j : ps.i];
-      if (pos[hi] > pos[lo]) { inversions++; log(`  ⚠ INVERSION: ${debugName(lo)} ranked above ${debugName(hi)} (H2H ${ps.wins}-${ps.loss})`); }
+      if (pos[hi] > pos[lo]) { inversions++; log(`  ⚠ ${debugName(lo)} ranked above ${debugName(hi)} despite losing H2H ${ps.wins}-${ps.loss}`); }
     }
-    log("decided-H2H inversions:", inversions, inversions ? "⚠" : "✓");
+    log("head-to-head inversions (cycle effect):", inversions, inversions ? "(expected if picks loop)" : "✓ none");
   }
 
   // win/games tally
@@ -1744,6 +1891,7 @@ function renderComparison(a, b, onPick) {
 function showResults(items, opts) {
   const isRanked = !(opts && opts.ranked === false);
   Engine.reset();
+  resultsItems = isRanked ? items : null;   // enable the per-track breakdown modal
   els.headerSub.textContent = currentFolder + (isRanked ? " — ranked!" : "");
   els.resultsLanes.innerHTML = "";
 
@@ -1777,11 +1925,11 @@ function showResults(items, opts) {
     // snapshot lacks the vote totals.
     const won = sc && sc.votesWon != null ? sc.votesWon : (sc ? sc.wins : 0);
     const tot = sc && sc.votesTotal != null ? sc.votesTotal : null;
-    // "won 5 of the 5 times you compared it" — label it so the bare fraction
-    // isn't mistaken for a rank or a matchup count. (See the "Why this ranking?"
-    // table below for the full per-opponent breakdown.)
+    // The picks count (total wins / total games) IS the ranking basis now, so it
+    // always agrees with the rank — more picks = higher rank. Clickable: opens a
+    // step-by-step breakdown of the per-rival record that sums to this total.
     const scoreHTML = (isRanked && sc && tot)
-      ? `<span class="score" title="how many of your A/B picks went to this track, out of the times it appeared">${won}/${tot}<span class="score-lbl"> picks</span></span>`
+      ? `<button class="score score-btn" type="button" data-explain-key="${escapeHtml(item.key)}" title="See how this rank was decided">${won}/${tot}<span class="score-lbl"> picks</span> <span class="score-why">why?</span></button>`
       : "";
     // tie note when this track shares its cluster rank with a neighbor.
     const tieNote = (isRanked && sc && sc.tied)
@@ -1812,6 +1960,44 @@ function showResults(items, opts) {
   syncUrl(currentFolder, isRanked ? "ranking" : "listen");
 }
 
+// Plain-English verdict for one matchup, graded purely on its signed score
+// (the +0.xx contribution) so the word always matches the number beside it.
+// Deliberately NOT tied to the engine's decided/tied/floor states: this is a
+// human explanation of a finished ranking, so it reads off the one continuous
+// quantity the user sees. Magnitude → adverb, sign → preferred / disfavored.
+// Plain-English outcome of one head-to-head, from the raw W–L record. Graded by
+// how lopsided the pick was (this is descriptive flavor; the rank is set purely
+// by total wins). win/loss by simple majority; even split = "too close to call".
+function gradeOutcome(wins, loss) {
+  if (wins === loss) return { label: "too close to call", cls: "ex-tie" };
+  const total = wins + loss;
+  const share = Math.max(wins, loss) / total;          // 0.5..1
+  const strength = share >= 0.80 ? "strongly" : share >= 0.62 ? "clearly" : "narrowly";
+  return wins > loss
+    ? { label: `${strength} preferred`,  cls: "ex-win"  }
+    : { label: `${strength} the other way`, cls: "ex-loss" };
+}
+
+// Reconstruct the rating engine from the saved vote log (works after reload —
+// the log is the source of truth) and return { explain, nameOf } for the current
+// set, or null if there's nothing to explain. Shared by the transparency table
+// and the per-track breakdown modal.
+function buildExplainData(items) {
+  const Core = window.PreferenceCore;
+  const state = currentFolder ? Store.load(currentFolder) : null;
+  const voteLog = (state && state.votes) || [];
+  if (!Core || !voteLog.length) return null;
+  const keys = items.map(it => it.key);
+  const core = new Core(keys);
+  core.replay(voteLog);
+  const byKey = new Map(items.map(it => [it.key, it]));
+  const nameOf = (k) => {
+    const it = byKey.get(k);
+    return it ? (it.file ? it.file.replace(/\.[^.]+$/, "") : k) : k;
+  };
+  return { explain: core.explain(), nameOf };
+}
+
 // Render the transparency table: for each track, the head-to-head record behind
 // its rank, and how each result fed its score — proving WHY the winner won.
 function renderExplain(isRanked, items) {
@@ -1820,31 +2006,9 @@ function renderExplain(isRanked, items) {
   wrap.innerHTML = "";
   if (!isRanked) return;
 
-  // Reconstruct the engine from the saved vote log (works after reload).
-  const Core = window.PreferenceCore;
-  const state = currentFolder ? Store.load(currentFolder) : null;
-  const voteLog = (state && state.votes) || [];
-  if (!Core || !voteLog.length) return;
-
-  const keys = items.map(it => it.key);
-  const core = new Core(keys);
-  core.replay(voteLog);
-  const explain = core.explain();
-
-  // map a key to its display name (real filename — names are revealed here)
-  const byKey = new Map(items.map(it => [it.key, it]));
-  const nameOf = (k) => {
-    const it = byKey.get(k);
-    return it ? (it.file ? it.file.replace(/\.[^.]+$/, "") : k) : k;
-  };
-  const OUTCOME = {
-    "beat":         { label: "you preferred it",        cls: "ex-win"  },
-    "lost":         { label: "you preferred the other", cls: "ex-loss" },
-    "tied":         { label: "too close to call",       cls: "ex-tie"  },
-    "leaning-win":  { label: "leaning your way",        cls: "ex-win"  },
-    "leaning-loss": { label: "leaning the other way",   cls: "ex-loss" },
-    "even":         { label: "dead even so far",        cls: "ex-tie"  },
-  };
+  const data = buildExplainData(items);
+  if (!data) return;
+  const { explain, nameOf } = data;
 
   let html = `<details class="explain" open>
     <summary><strong>Why this ranking?</strong> <span class="muted">— every comparison you made, and how it added up</span></summary>`;
@@ -1852,12 +2016,6 @@ function renderExplain(isRanked, items) {
   for (const e of explain) {
     const name = nameOf(e.key);
     const tieTag = e.tied ? ` <span class="tie-note">≈ tied for #${e.rank}</span>` : "";
-    // a one-line plain-English summary of this track's record
-    const beat = e.matchups.filter(m => m.outcome === "beat").map(m => nameOf(m.opp));
-    const lost = e.matchups.filter(m => m.outcome === "lost").map(m => nameOf(m.opp));
-    const summaryBits = [];
-    if (beat.length) summaryBits.push(`beat ${beat.length}`);
-    if (lost.length) summaryBits.push(`lost to ${lost.length}`);
     const recordLine = `${e.votesWon} of ${e.votesTotal} picks went its way`;
 
     html += `<div class="ex-card">
@@ -1867,34 +2025,87 @@ function renderExplain(isRanked, items) {
         <span class="ex-rec muted">${recordLine}</span>
       </div>
       <table class="ex-table"><tbody>`;
-    // running total so the per-row contributions visibly SUM to the score that
-    // ranked this track — proving the order isn't arbitrary.
-    let _scoreTotal = 0;
-    for (const m of e.matchups) _scoreTotal += m.contribution;
+    // each matchup's WINS sum to the track's total wins — the number that sets
+    // the rank. The contribution column is just the wins it earned in that duel.
     for (const m of e.matchups) {
-      const o = OUTCOME[m.outcome] || { label: m.outcome, cls: "" };
-      const contrib = (m.contribution >= 0 ? "+" : "") + m.contribution.toFixed(2);
-      const contribCls = m.contribution > 0.01 ? "ex-pos" : m.contribution < -0.01 ? "ex-neg" : "ex-zero";
+      const o = gradeOutcome(m.wins, m.loss);
       html += `<tr class="${o.cls}">
         <td class="ex-vs">vs <strong>${escapeHtml(nameOf(m.opp))}</strong> <span class="muted">#${m.oppRank}</span></td>
         <td class="ex-score">${m.wins}–${m.loss}</td>
         <td class="ex-outcome">${o.label}</td>
-        <td class="ex-contrib ${contribCls}">${contrib}</td>
+        <td class="ex-contrib ex-pos">+${m.wins}</td>
       </tr>`;
     }
-    const totalStr = (_scoreTotal >= 0 ? "+" : "") + _scoreTotal.toFixed(2);
     html += `<tr class="ex-total">
-        <td colspan="3"><strong>Total score</strong> <span class="muted">— sum of the column → sets the rank</span></td>
-        <td class="ex-contrib"><strong>${totalStr}</strong></td>
+        <td colspan="3"><strong>Total wins</strong> <span class="muted">— sum of the column → sets the rank</span></td>
+        <td class="ex-contrib"><strong>${e.score}</strong></td>
       </tr>`;
     html += `</tbody></table></div>`;
   }
 
-  html += `<p class="ex-legend muted">The last column is how much each matchup added to (or subtracted from) this track's score.
-    A win counts for more when it's over a <em>higher-ranked</em> track and you picked it <em>consistently</em> —
-    a single lucky pick barely moves it. That's how a track can finish on top even without beating everyone head-to-head.</p>
+  html += `<p class="ex-legend muted">The last column is how many of your picks each track won in that matchup.
+    Add them up and you get the track's total wins — and the ranking is simply most wins to fewest.
+    Because every track played every other the same number of times, that's a fair head-to-head count.</p>
   </details>`;
   wrap.innerHTML = html;
+}
+
+// Per-track "how did it get this rank?" — a step-by-step derivation in a modal,
+// opened by clicking a track's picks readout on the results screen. Two steps:
+// (1) your record vs each rival, (2) add up the wins = the rank. Reads off the
+// same explain() data as the table, so it can't drift from the real ranking.
+function openScoreBreakdown(key) {
+  if (!resultsItems) return;
+  const data = buildExplainData(resultsItems);
+  if (!data) return;
+  const { explain, nameOf } = data;
+  const e = explain.find(r => r.key === key);
+  if (!e) return;
+
+  const name = nameOf(e.key);
+
+  // Step 1 — your record vs each rival (the raw picks).
+  let rivals = "";
+  for (const m of e.matchups) {
+    const v = gradeOutcome(m.wins, m.loss);
+    rivals += `<tr class="${v.cls}">
+      <td class="ex-vs">vs <strong>${escapeHtml(nameOf(m.opp))}</strong> <span class="muted">#${m.oppRank}</span></td>
+      <td class="ex-score">${m.wins}–${m.loss}</td>
+      <td class="ex-outcome">${v.label}</td>
+      <td class="ex-contrib ex-pos">+${m.wins}</td></tr>`;
+  }
+
+  const otherWins = e.matchups.length; // count of rivals played
+  const lead = `<span class="brk-rank">#${e.rank}${e.tied ? " (tied)" : ""}.</span>
+    The ranking is simply <strong>total wins</strong> — how many of your picks each
+    track won across every matchup. Since every track played every other the same
+    number of times, that's a fair count. Here's ${escapeHtml(name)}'s:`;
+
+  const html = `
+    <h3>${escapeHtml(name)} — why #${e.rank}?</h3>
+    <p class="brk-lead">${lead}</p>
+
+    <div class="brk-step">
+      <h4>Step 1 — your record against each rival</h4>
+      <table class="ex-table"><tbody>${rivals}
+        <tr class="ex-total"><td colspan="3"><strong>Total wins</strong></td>
+          <td class="ex-contrib"><strong>${e.score}</strong></td></tr>
+      </tbody></table>
+    </div>
+
+    <div class="brk-step">
+      <h4>Step 2 — that total sets the rank</h4>
+      <p class="muted" style="margin:0;font-size:13px;">
+        ${escapeHtml(name)} won <strong>${e.score}</strong> of your picks across
+        ${otherWins} matchups. Ranking is most wins to fewest — so it lands at
+        <strong>#${e.rank}</strong>${e.tied ? ", tied with another track on the same win count" : ""}.
+      </p>
+    </div>
+
+    <div class="modal-actions">
+      <button class="primary" type="button" data-close>Got it</button>
+    </div>`;
+  openModal(html);
 }
 
 function escapeHtml(s) {
@@ -1906,6 +2117,16 @@ function escapeHtml(s) {
 /* buttons */
 els.transportPlay.addEventListener("click", () => Engine.togglePlay());
 els.resultsPlay.addEventListener("click", () => Engine.togglePlay());
+
+// Clicking a track's picks readout opens its step-by-step rank breakdown.
+// Delegated so it survives lane re-renders. Stop propagation so the click
+// doesn't reach the lane's own play/select handler.
+els.resultsLanes.addEventListener("click", (e) => {
+  const btn = e.target.closest(".score-btn");
+  if (!btn) return;
+  e.stopPropagation();
+  openScoreBreakdown(btn.getAttribute("data-explain-key"));
+});
 if (els.transportMute) els.transportMute.addEventListener("click", () => Engine.toggleMute());
 if (els.resultsMute) els.resultsMute.addEventListener("click", () => Engine.toggleMute());
 
@@ -1949,6 +2170,12 @@ document.getElementById("resultsCrumbHome").addEventListener("click", goToSelect
 
 // debug-only: copy a full engine diagnostic to the clipboard
 document.getElementById("debugCopy").addEventListener("click", copyDebugDiagnostic);
+
+// header debug toggle. stopPropagation so it doesn't trigger the header's
+// "go home" click below. Reflect the persisted state on load.
+const _debugToggleBtn = document.getElementById("debugToggle");
+_debugToggleBtn.addEventListener("click", (e) => { e.stopPropagation(); onDebugToggleClick(); });
+syncDebugToggle();
 
 // the header title bar also returns to the set list (when not already there)
 document.querySelector("header").addEventListener("click", () => {

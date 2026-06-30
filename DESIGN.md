@@ -1,256 +1,145 @@
 # Audio Comparison — Ranking & Confidence Design
 
 This document is the source of truth for how the comparison tool decides a
-ranking and how it talks to the user about it. The math deliberately stays
-simple enough to read off a head-to-head grid by hand — no Bradley–Terry, no
-maximum-likelihood, no Fisher information. Those were ripped out because they
-produced rankings that **contradicted the user's own direct choices** (the
-global strength fit would float an item to #1 even though the user picked a
-different item over it 3-to-1 head-to-head). The whole point of this tool is
-"I like this one more than that one," so the ranking is built *from* the
-head-to-heads, never from a score that can override them.
+ranking and how it talks to the user about it.
 
-## What the user wants (the requirements, in their words)
+## The model in one sentence
 
-1. **"Find the one I like most"** is the #1 goal. The rest of the order is
-   "interesting too" but secondary.
-2. **"Winning more than B means nothing if C never got a chance to play."**
-   Raw win *counts* are biased by who got served against whom. Ranking must be
-   pairwise, not points-based.
-3. **"I want 'like this one more than that one.'"** The unit of truth is a
-   head-to-head: when two items were compared, which did the user pick.
-4. **"Until I've compared every option to every other, you never really know."**
-   Confidence is driven by *coverage* of pairings, not a clever model.
-5. **"A bracket is too easy to get wrong, and comparing things changes my
-   opinion."** Nothing gets eliminated; every vote is kept; later votes revise
-   earlier standings.
-6. **"If we keep getting ties, they really are the same."** A tie is a valid
-   *answer*, not a failure to separate. Once confirmed, stop asking.
-7. **Two kinds of user must both be served:** the friend who votes once or
-   twice and wants a quick answer, AND the friend who grinds 50–100 votes and
-   wants to watch confidence climb. Completion must be fast; confidence is
-   optional and unbounded.
+**Rank by total wins.** Each track's score is how many of your A/B picks it won,
+summed across every matchup. Highest win count is #1. Equal win counts tie.
 
-## Core model: a round-robin head-to-head grid
+That's the whole ranking. The rest of this document explains *why* it's that
+simple, and how the voting flow guarantees the count is fair.
 
-The only stored state is the full vote log (already persisted). From it we
-tally one grid:
+## Why total wins (and why nothing fancier)
 
-    wins[i][j]  = number of times the user picked i over j
-    games[i][j] = wins[i][j] + wins[j][i]  (times i and j were compared)
+The unit of truth is a head-to-head: when two tracks were compared, which did you
+pick. We want the simplest rule that turns those picks into an order the user can
+trust and understand.
 
-Everything below is computed from this grid.
+Three different-looking formulas all collapse to the same ranking **as long as
+every track plays every other track the same number of times**:
 
-### Pair states
+- **total wins** (count the picks it won),
+- **win rate** (wins ÷ games played),
+- **win/loss ratio** (wins ÷ losses).
 
-Every unordered pair is in exactly one of three states:
+They're monotonic transforms of each other when games are equal, so they produce
+the *identical* order. We use **total wins** because it's the most human:
+"you picked it 37 times" needs no explanation, and it's exactly the number shown
+on the results screen — so the displayed count can never disagree with the rank.
 
-| State        | Condition                                              | Meaning                              |
-|--------------|--------------------------------------------------------|--------------------------------------|
-| `unseen`     | `games == 0`                                           | Never compared — we truly don't know |
-| `provisional`| `games >= 1` but `< MEET_FLOOR`, has a leader          | A guess, lightly backed (could flip) |
-| `decided`    | `games >= MEET_FLOOR` AND one side `> DECIDE_FRAC`     | The user clearly prefers one side    |
-| `tied`       | `games >= MEET_FLOOR` AND roughly even (not `decided`) | Confirmed equivalent — stop asking   |
+### What was tried and removed (and why)
 
-Constants:
+- **Bradley–Terry / maximum-likelihood strength fit.** Removed: the global fit
+  produced rankings that *contradicted the user's direct picks* — it would float
+  a track to #1 even though the user picked another over it head-to-head, because
+  its blowouts over weak tracks implied a high "latent strength." The tool's whole
+  premise is "I like this one more than that one," so an aggregate score that can
+  override a direct pick is wrong by definition.
+- **Copeland + cycle-breaking (matchups won − lost, Tarjan SCC, opponent-weighted
+  tiebreak).** Removed: it was cycle-aware and never contradicted a *decided*
+  direct pick, but it produced rankings that disagreed with the on-screen "picks"
+  count — a track with *fewer* total picks could rank *higher* (it won more
+  distinct matchups). That inversion confused users far more than it helped, and
+  the machinery (SCC clustering, opponent weighting, decided/tied thresholds) was
+  a lot of surface area to explain a result the user found surprising.
 
-- `MEET_FLOOR = 3` — a pair must be compared at least this many times before it
-  can be called a *confirmed* `decided` or `tied`. Below the floor, a pair with
-  a leader is only `provisional` ("close — vote again to confirm"). This is the
-  "comparing changes my opinion / voting a lot ≠ ranking once" requirement.
-- `DECIDE_FRAC = 2/3` — above the floor, a pair is `decided` only if more than
-  two-thirds of its meetings went one way (3–1, 4–1, 4–2…). Otherwise it's a
-  confirmed `tied` (2–2, 3–2, 3–3…).
+### The known trade-off we accepted
 
-A `provisional` pair still has a *direction* (the side currently ahead, or a
-single 1–0 result). That direction is used to build the ranking after one pass;
-it just carries low confidence.
+Total wins is **not** cycle-aware. If your picks form a loop (you prefer A over B,
+B over C, but C over A — common when tracks are close and context shifts your
+ear), total wins still prints a confident linear order and stays silent about the
+loop underneath. We accept this: it's simpler, it always agrees with the visible
+picks count, and a margin/Copeland model can't honestly order a cycle either —
+it just fails differently. Where ties *do* surface (equal win counts), we show
+them (see "Ties").
 
-## Completion vs. Confidence — the two separate ideas
+### Why margins are deliberately ignored
 
-This split is the heart of the design. **Completion and confidence are NOT the
-same number.**
+A bigger win margin over a weak track does **not** mean a better track — it often
+just means the two are *less similar in flavor*. A warm guitar beats a warm
+"crappy" guitar by a smaller margin than a bright guitar does, not because it's
+worse, but because it's closer in character. Rewarding margin therefore rewards
+"sounds least like the worst track," which can promote a track above one the user
+directly preferred. Counting wins (not margins) sidesteps this entirely.
 
-- **Completion** = "does every pair have an answer?" A pair has an answer once
-  it's been seen at least once (`games >= 1`) — provisional counts. The moment
-  every pair is non-`unseen`, the tool is **done**: it shows the full ranking
-  and never forces the user to continue.
-  - One full pass of an N-item set is `C(N,2)` votes (21 for 7 items). After
-    that pass, **completion is reached** even though most pairs are only
-    `provisional`.
-- **Confidence** = "how hard-backed are those answers?" This is the optional,
-  unbounded climb. It rises as pairs cross from `provisional` into `decided` or
-  confirmed `tied`. The grinder pushes this up; the casual voter ignores it.
+## Completion is round-based
 
-> Quick player: complete, correctly-ordered answer in one pass, low confidence,
-> free to leave. Grinder: same answer, watches confidence climb, and knows they
-> already had a valid answer the whole time.
+You can't rank fairly by win count on a *partial* round-robin — if some tracks
+have played more games than others, raw win counts aren't comparable. So:
 
-## The ranking — Copeland score + cycle-aware clusters
+- A **round** is one full round-robin: every unordered pair played once
+  (`C(N,2)` votes — 10 for 5 tracks).
+- **No ranking exists until at least one full round is complete.** The "Show
+  results" button is hard-disabled until then, showing "N more to finish the
+  first round."
+- After each completed round, a **round-complete modal** appears: "Round N
+  complete — vote more or view results," flagging any ties. The user can stop
+  with a fair ranking, or keep going for more rounds (which only firms it up).
 
-Rank is built so it never contradicts a user's direct, decided preference, and
-so it stays consistent even when preferences contain cycles (which real
-subjective preferences often do — see below).
+## Matchmaking — pure round-robin
 
-1. **Copeland score**: each item scores `(matchups won − matchups lost)` against
-   the field, each opponent counted ONCE (a 9–0 blowout is worth the same as
-   5–4: one matchup won, not nine points). Decided pair → ±1; an unsettled
-   provisional lean → ±0.5; `tied`/`unseen` → 0. Unlike a pairwise comparator,
-   Copeland is **cycle-proof** — it always yields a single consistent order, and
-   within a cycle it favors whoever beat the most others.
-2. **Order** by Copeland, breaking ties by the direct decided head-to-head
-   (direct preference is king), then net win-fraction, then overall win rate.
-3. **Cluster** via strongly-connected components of the "decided beats" graph
-   (Tarjan SCC). A cluster forms from a **cycle** of decided results (A>B, B>C,
-   C>A — rock-paper-scissors) or a **confirmed tie** at equal Copeland standing.
-   Decided results that don't form a cycle never merge; an unsettled
-   (provisional) pair is a *tentative order*, not a tie, so it does not merge.
-4. **Break clusters by opponent-weighted score.** Members of a cycle aren't
-   really equal — one usually beat the *stronger* opponents on balance. Within a
-   cluster we order members by the opponent-weighted score (below), giving them
-   distinct, real ranks. They only stay tied (shared rank) if even that score is
-   a dead heat — a genuinely symmetric cycle with no signal to separate.
+`nextPair()` always serves a pair from the **least-played tier**: no pair gets its
+(k+1)th meeting until every pair has had its kth. Among the equally-least-played,
+it picks uniformly at random. This guarantees full, equal coverage — the
+precondition that makes win-count fair — and naturally completes rounds in order.
 
-### Opponent-weighted score — "a win over a strong guitar is worth more"
+No closeness/adjacency nudges, no tie-seeding, no cycle chasing. (An early version
+over-weighted close pairs and ground one pair to 13 meetings while others got 3 —
+lopsided sampling that made win counts incomparable.)
 
-A win over a strong opponent should count more than a win over a weak one — but
-only if it's a RELIABLE result, not a fluke. For each item, summed over the
-opponents it has played:
+## Confidence tier — driven by ROUNDS COMPLETED
 
-    net(i,j)  = (wins_ij − wins_ji) / games_ij            // −1..+1, your lean
-    qual(j)   = opponent j's Copeland strength, squashed to [0.5, 1.5]  (BOUNDED)
-    reliability(i,j) = min(1, games/MEET_FLOOR) · |net|   // fluke 1–0 ≈ 0, 5–1 ≈ 1
-    contribution = net(i,j) · (1 + (qual(j) − 1) · reliability(i,j))
+Shown as a label. More full round-robins = more confident, full stop:
 
-Three deliberate stabilizers (so this can't become the runaway Bradley–Terry was):
-- **Bounded** weight (0.5×–1.5×): no single result can dominate; the top stays
-  catchable.
-- **One pass, no iteration**: the "beat-the-strong" credit can't compound into a
-  blow-up.
-- **Reliability-gated**: a lucky 1–0 upset over the champ contributes ~nothing;
-  the credit fades in only as the result is repeated/confirmed. So early rounds
-  behave like plain round-robin counting (you're still figuring out your answer),
-  and quality-weighting only matters once records are solid — which is also when
-  it's stable.
-
-It is used ONLY to order WITHIN a cluster (it never moves an item across cluster
-lines, so it can't override clean direct results elsewhere).
-
-### "Why this ranking?" — the transparency table
-
-`PreferenceCore.explain()` returns, per item in ranked order, every head-to-head
-it played: the W–L record, a plain-English outcome (you preferred it / preferred
-the other / too close to call), and that matchup's signed CONTRIBUTION to the
-item's score. The contributions sum exactly to the item's opponent-weighted score
-(verified), so the results-page table can show the user the full causal chain
-from their picks to the final rank — including the non-obvious case where a track
-finishes #1 without beating everyone head-to-head (it beat the *stronger* tracks
-more consistently). The table reconstructs a core from the saved vote log, so it
-works on reload. It is shown only on the ranked results view (never mid-vote —
-blind test).
-
-### Cycles are a real outcome, not a bug
-
-With enough votes on close items, preferences often form a loop: you pick A over
-B, B over C, C over A depending on what you're A/B-ing in the moment. **No
-*pairwise* rule can order a cycle without violating one of your direct picks.**
-The opponent-weighted score resolves it the fair way — by *who* each member beat
-— so an asymmetric cycle yields a real winner. A perfectly symmetric cycle (every
-member equivalent) honestly stays a tie: when the data says "these are equal,"
-we say so. A cycle/tie at #1 is a **winner's circle**, shown together; "no clear
-#1" is not a stuck state — it *is* the answer.
-
-## The progress bar — three phases, one bar
-
-The bar communicates *which phase you're in and how much further to the next
-milestone*, NOT "0→100% complete." Under the bar, text always names the phase
-and the small, reachable next number.
-
-| Phase | True when… | Message (must / may / just-for-confidence) |
-|-------|------------|--------------------------------------------|
-| **1. Finding the winner** | Top cluster not yet locked | *"Keep going — no winner yet. ~N votes."* (must continue) |
-| **2. Settling the rest**  | Top cluster locked; lower clusters still have provisional/close pairs | *"🏆 Winner: X. Spots 3–4 still close — ~N to settle (or stop)."* (may continue) |
-| **3. Raising confidence** | Every pair decided or confirmed-tied | *"Ranking settled — keep voting only to raise confidence."* (optional) |
-
-A **"good enough to stop" marker** sits on the bar at the end of phase 2, so the
-user can *see* that everything past it is bonus. This is the retention release
-valve: passing the marker means "you didn't fail to finish — the rest is extra."
-
-Note completion (one pass) can arrive during phase 1 or 2; the bar/phase text is
-about *confidence milestones*, while the "you're done, here's your ranking" state
-is governed by completion. A user can be "done" (has a full ranking) while the
-bar still invites more votes to firm it up.
-
-## The confidence tier — driven by ROUNDS COMPLETED
-
-Shown as a tier label. The principle the user settled on: **the more full
-round-robins you've done, the more confident — full stop.** It's simple,
-monotonic (rounds only increase, so it never bounces), and a tie still earns
-high confidence (you've done the work; the answer just happens to be "equal").
-
-    0 rounds → "building"       (before the first round-robin completes)
+    0 rounds → "building"        (before the first round completes)
     1 round  → "Pretty sure"
     2 rounds → "Confident"
     3 rounds → "Very confident"
     4+ rounds→ "Rock solid"
 
-History worth keeping: earlier versions tied this to a *statistical* measure
-(separation of adjacent items, weakest-link). That wiggled — a genuine near-tie
-stays close no matter how much you vote, so it read as low/volatile confidence,
-which confused users sitting next to a steadily-climbing round bar. Rounds-based
-confidence removed the wiggle and matches intuition. (`competence`, the old
-evidence-average, is still computed in status() but no longer drives the tier.)
+Monotonic (rounds only increase, so it never bounces), and a tie still earns high
+confidence — you did the work; the answer just happens to be "equal." This is a
+separate signal from the progress bar.
 
-## "Votes remaining" — the retention number
+## The progress bar
 
-The user said telling people how much longer is **critical** to stop them
-leaving. We estimate work to the **next milestone** only (never the far finish):
+The bar tracks **round-robin progress**: 1/3 per completed round (≥3 dots, one dot
+per round), the current round adding a fraction. A 4th round expands the bar to a
+4th dot, etc. It only moves forward and maps exactly to the voting done.
+`status()` exposes `roundsComplete / roundProgress / roundJustDone / dots / fill /
+votesToRound / currentRound / tier / ties / hasTies / ready`.
 
-- **To complete:** count `unseen` pairs (each needs ~1 vote to register).
-- **To crown the winner (phase 1→2):** votes for the top boundary to lock
-  (reach the floor with a ≥2 margin, or confirm a top tie).
-- **To settle the rest (phase 2→3):** sum over still-`provisional` pairs of how
-  many more meetings each needs to reach `MEET_FLOOR` (≈ `MEET_FLOOR - games`).
+## Ties
 
-Always display the smallest, nearest milestone ("~4 votes to your winner"),
-because "37 to fully resolve" makes people quit.
+Tracks with equal win counts share a rank (a tie). Ties are surfaced two places:
 
-## Matchmaking — round-robin cycles
+- The **round-complete modal** flags that a tie exists ("a 3-way tie for 2nd
+  place — vote more to break it"), naming only the rank, not the tracks (the
+  voting screen is a blind test).
+- The **results page** groups tied tracks at a shared rank with a "≈ tied" note.
 
-The matchmaker's job is EVEN coverage, not chasing close pairs. (An earlier
-version over-weighted "closeness + adjacency" and ground one near-tie to 13
-meetings while other pairs got 3 — that lopsided sampling is exactly what
-manufactures noisy decided results and spurious cycles.)
+A tie is a valid *answer* (these really are equal to you), not a failure — but
+because more rounds can break it, we nudge.
 
-- **Dominant rule: serve from the least-played tier.** Only pairs at the current
-  minimum game count are eligible, so no pair gets its 2nd meeting until every
-  pair has had its 1st, its 3rd until every pair has a 2nd, etc. This is a
-  repeated full round-robin: everyone vs everyone, then everyone vs everyone
-  again — exactly even coverage.
-- **Closeness/adjacency is only a gentle tiebreak** among the equally-least-
-  played, so within a round the informative matchups come a little sooner.
-- **Tie-for-first breaking is SPORADIC, not dominant.** Once the first full
-  round-robin is in and there's a real tie at the top, the tied contenders' pairs
-  get a *modest* boost — enough to seed a round, not to fixate. The round-robin
-  floor still pulls every other pair along, so a new round may *open* with the
-  tied leaders but still gives every pair another meeting.
+## "Why this ranking?" — the transparency table
 
-## Constants summary
+`PreferenceCore.explain()` returns, per track in ranked order, every head-to-head
+it played: the W–L record and how many picks it won there. The per-matchup wins
+sum exactly to the track's total wins (the rank-setting number), so the results
+table proves the ranking. Each track's picks readout on the results page is also
+clickable, opening a per-track step-by-step modal (your record vs each rival →
+total wins → rank). Shown only on the ranked results view, never mid-vote (blind
+test).
 
-| Name          | Value | Role                                                        |
-|---------------|-------|-------------------------------------------------------------|
-| `MEET_FLOOR`  | 3     | Min meetings before a pair is *confirmed* decided/tied      |
-| `DECIDE_FRAC` | 2/3   | Fraction one-sided needed to be `decided` (else `tied`)     |
-| `WIN_MARGIN`  | 2     | Head-to-head margin for the top boundary to "crown" #1      |
+## Blind test
 
-## What was removed
+The voting screen NEVER reveals track names (no winner name in the status line,
+no names in the round-complete modal). Names appear only on the results screen.
+(`?debug=true`, or the header Debug toggle, reveals names for testing.)
 
-- Bradley–Terry MLE / MM iteration, latent strengths `θ`, the `1500 + SCALE·θ`
-  Elo-style display rating.
-- Fisher-information standard errors and the `z`-score significance test
-  (`SEP_Z`), including the "≈ tied" flag based on overlapping `r ± rd` intervals.
-- The single `precision()` metric that conflated coverage and separation and
-  could never reach 100% when genuine ties existed.
+## Constants
 
-Display ratings, if still shown, are derived directly from matchup record
-(e.g. win rate), not from a fitted strength.
+There are no ranking thresholds anymore — win count needs none. The only structural
+constant is the round-robin itself (`C(N,2)` votes per round).

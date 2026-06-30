@@ -10,58 +10,67 @@ share.
 
 - **`preference-rating.js`** — the pure ranking engine (no DOM). Single source of
   truth for the math. Has a built-in zero-dependency test suite: run
-  `node preference-rating.js` (currently **75/75 green** — keep it that way).
+  `node preference-rating.js` (currently **144/144 green** — keep it that way).
   Exposes `window.PreferenceCore` in the browser.
 - **`index.html`** — the entire UI (inline `<script>`), audio engine, waveforms,
   router, and rendering. Loads the core via a timestamped `document.write` so the
   browser can never serve a stale copy.
 - **`DESIGN.md`** — the full rationale for the ranking model and UX decisions.
-  Read it before changing ranking/confidence/matchmaking behavior.
+  Read it before changing ranking/confidence/matchmaking behavior. update it when changing behavior.
 - **`audio/<set>/*.mp3`** — the comparison sets (gitignored).
 
-## How the ranking works (see DESIGN.md for depth)
+## Ranking, matchmaking & confidence — DESIGN.md owns the "why"
 
-NOT Bradley-Terry (that was ripped out — it overrode the user's direct picks).
-The model is deliberately simple and explainable:
+**`DESIGN.md` is the source of truth for ranking/confidence/matchmaking
+rationale.** Read it before changing any of that behavior; update it when you do.
+What follows here is only the operational surface — the invariants you must not
+break and the names you'll touch. For *why* it's this way (the Bradley–Terry and
+Copeland post-mortems, the margins-vs-flavor argument), go to DESIGN.md.
 
-- **One head-to-head grid**: `wins[i][j]` = times the user picked i over j. The
-  full vote log is persisted to localStorage and is the source of truth (ranking
-  is rebuilt by replaying it).
-- **Pair states**: `unseen` / `provisional` (<3 meetings) / `decided` (≥3 and
-  >⅔ one-sided) / `tied` (≥3, roughly even). Floor = `MEET_FLOOR = 3`.
-- **Ranking = Copeland score** (matchups won − lost), which is cycle-proof.
-- **Cycles** (rock-paper-scissors: A>B>C>A) are detected via Tarjan SCC and
-  **broken by an opponent-weighted score** — a win over a STRONGER opponent
-  counts more, but only when RELIABLE (bounded 0.5–1.5×, one-pass, reliability-
-  gated so a fluke 1–0 ≈ 0). A truly symmetric cycle stays a tie.
-- **Real preference cycles are a legitimate outcome**, not a bug — when items are
-  near-equal the user's picks genuinely loop.
+Invariants (do not break without updating DESIGN.md):
 
-## Matchmaking (`nextPair`)
-
-Pure **round-robin**: always serves the least-played pair, so coverage is even
-(everyone vs everyone, then again). A gentle adjacency nudge orders within a
-round; a small sporadic boost seeds a top-tie break. NEVER fixate on close pairs
-(an early version ground one pair to 13 games while others got 3 — that
-manufactured spurious cycles).
-
-## The progress bar + confidence (two SEPARATE signals)
-
-- **Bar = round-robin progress.** 1/3 per completed round, ≥3 dots, one dot per
-  round; a 4th round expands the bar to a 4th dot, etc. `status()` exposes
-  `roundsComplete / roundProgress / dots / votesToRound / currentRound`. The bar
-  is monotonic within a fixed dot count.
-- **Confidence tier follows ROUNDS COMPLETED** (the user's final decision):
+- **Vote log is the source of truth.** `wins[i][j]` grid is rebuilt by replaying
+  the persisted log; ranking is derived, never the stored authority.
+- **Ranking = TOTAL WINS.** `score(i) = Σ_j wins[i][j]` (every pick it won),
+  highest first, equal counts tie. NOT Bradley–Terry, NOT Copeland — both were
+  removed (BT overrode direct picks; Copeland disagreed with the on-screen picks
+  count). Because games are equal, total wins == win rate == win/loss order; we
+  use the count because it's the most explainable and equals the picks readout.
+  NOT cycle-aware — that's an accepted trade-off (see DESIGN.md).
+- **Ranking only exists after a FULL round-robin.** Win-count is unfair on a
+  partial cycle (unequal games). Results are gated on `status().ready`
+  (`roundsComplete ≥ 1`).
+- **Matchmaking (`nextPair`) is pure round-robin** — always a least-played pair,
+  uniform random among ties. Finishes each round before any pair repeats. No
+  closeness/adjacency/cycle nudges.
+- **Confidence tier follows ROUNDS COMPLETED:**
   0→building, 1→Pretty sure, 2→Confident, 3→Very confident, 4+→Rock solid.
-  Monotonic, never bounces, a tie still earns high confidence. (The old
-  `competence` evidence-average is still computed but no longer drives the tier.)
-- **Readout wording** (`statusParts` in index.html), always shows vote count:
+- No ranking threshold constants anymore (`MEET_FLOOR`/`DECIDE_FRAC`/`WIN_MARGIN`
+  are gone).
+
+Status API: `status()` exposes `ready / roundsComplete / roundProgress /
+roundJustDone / dots / fill / votesToRound / currentRound / tier / ties /
+hasTies`. The progress bar = round-robin progress (1/3 per completed round, ≥3
+dots, monotonic within a fixed dot count); SEPARATE from the confidence tier.
+
+## Round-complete flow
+
+When a vote completes a full round (`status().roundJustDone`), voting PAUSES and
+`onRoundComplete` shows a modal: "Round N complete — vote more / view results,"
+flagging any ties ("a 3-way tie for 2nd place"). "Vote more" resumes
+`_serveNext`; "View results" calls `rater.finish()`. This is the ONLY way to
+reach results mid-grind besides the gated "Show results" button.
+
+## Voting-screen readout wording
+
+`statusParts` in index.html; always shows vote count:
+
   - before round 1 done: `"N votes · +K to your first ranking"`
   - round just completed: `"N votes · Ranking ready ✓ · <tier> · vote more to refine"`
-    (NO "+K to finish this round" — don't imply a phantom new round)
   - mid-round: `"N votes · Ranking ready ✓ · <tier> · +K to finish round X"`
-- **BLIND TEST**: the voting screen must NEVER reveal track names (no winner name
-  in the status line). Names appear only on the results screen.
+- **BLIND TEST**: the voting screen must NEVER reveal track names — not in the
+  status line, NOT in the round-complete modal (ties name the rank only, never
+  the track). Names appear only on the results screen.
 
 ## Routing (hashbang)
 
@@ -78,13 +87,13 @@ call `startSet` directly). Reload works; deep back/forward polish is deferred.
 - Breadcrumb "← All sets" at top of the card; actions ("Keep refining" primary,
   "Rank again from scratch") sit below the player, above the deep-dive table.
 - **"Why this ranking?"** table (`PreferenceCore.explain()` → `renderExplain`):
-  per item, every head-to-head with W–L, plain-English outcome, and that
-  matchup's signed contribution; a "Total score" row that SUMS to the item's
-  opponent-weighted score (so the table proves the ranking). `table-layout:fixed`
-  so columns align across cards. Score readout under each rank pill = overall
-  `votesWon/votesTotal` "picks", NOT decided-only.
-- Per-track score shown as "N/M picks" (overall record), labeled to avoid being
-  mistaken for a rank.
+  per item, every head-to-head with W–L, a plain-English outcome, and the picks
+  it won there (`+N`); a "Total wins" row that SUMS to the item's score (= its
+  rank). `table-layout:fixed` so columns align across cards.
+- **Picks readout under each rank pill is clickable** (`.score-btn` →
+  `openScoreBreakdown`): opens a per-track step-by-step modal (record vs each
+  rival → total wins → rank). The "N/M picks" number IS the ranking basis now
+  (total wins / total games), so it can never disagree with the rank.
 
 ## Persistence
 
@@ -95,7 +104,8 @@ so a refresh resumes the test rather than re-showing results.
 ## Conventions / gotchas
 
 - **Always run `node preference-rating.js` after touching the core** — keep
-  75/75 green. After touching index.html, sanity-check the inline script parses.
+  the suite green (currently **144/144**). After touching index.html,
+  sanity-check the inline script parses.
 - The core is cache-busted automatically (timestamp). No manual version bump.
 - Bronley dislikes approval prompts — prefer the dedicated Read/Grep/Edit tools
   over shell; one simple command per Bash call; avoid compound commands.
@@ -111,4 +121,6 @@ so a refresh resumes the test rather than re-showing results.
 - Router cleanup: route every navigation through `Router.go` for perfect
   back/forward (currently some direct `startSet` calls).
 - Dead code: `copyShareLink` / `Router.link` have no callers since the
-  copy-link buttons were removed; `competence` no longer drives the tier.
+  copy-link buttons were removed.
+- Ranking is NOT cycle-aware (accepted trade-off of win-count). If users start
+  caring about rock-paper-scissors loops, that's where to revisit the model.
