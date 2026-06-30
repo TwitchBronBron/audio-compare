@@ -136,6 +136,19 @@ Three deliberate stabilizers (so this can't become the runaway Bradley–Terry w
 It is used ONLY to order WITHIN a cluster (it never moves an item across cluster
 lines, so it can't override clean direct results elsewhere).
 
+### "Why this ranking?" — the transparency table
+
+`PreferenceCore.explain()` returns, per item in ranked order, every head-to-head
+it played: the W–L record, a plain-English outcome (you preferred it / preferred
+the other / too close to call), and that matchup's signed CONTRIBUTION to the
+item's score. The contributions sum exactly to the item's opponent-weighted score
+(verified), so the results-page table can show the user the full causal chain
+from their picks to the final rank — including the non-obvious case where a track
+finishes #1 without beating everyone head-to-head (it beat the *stronger* tracks
+more consistently). The table reconstructs a core from the saved vote log, so it
+works on reload. It is shown only on the ranked results view (never mid-vote —
+blind test).
+
 ### Cycles are a real outcome, not a bug
 
 With enough votes on close items, preferences often form a loop: you pick A over

@@ -299,6 +299,47 @@
   .muted { color: var(--muted); }
   .err { color: #ff6b6b; }
 
+  /* "Why this ranking?" transparency table */
+  .explain-wrap { margin-top: 22px; }
+  details.explain > summary {
+    cursor: pointer; padding: 10px 12px; border: 1px solid var(--border);
+    border-radius: 8px; background: var(--panel-2); list-style: none;
+    font-size: 15px;
+  }
+  details.explain > summary::-webkit-details-marker { display: none; }
+  details.explain > summary::before { content: "▸ "; color: var(--muted); }
+  details.explain[open] > summary::before { content: "▾ "; }
+  .ex-card {
+    border: 1px solid var(--border); border-radius: 8px;
+    margin-top: 12px; padding: 12px 14px; background: rgba(255,255,255,.02);
+  }
+  .ex-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; margin-bottom: 8px; }
+  .ex-rank {
+    font-weight: 800; font-size: 13px; min-width: 30px; text-align: center;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 1px 7px;
+  }
+  .ex-name { font-weight: 700; font-size: 15px; }
+  .ex-rec { font-size: 12px; margin-left: auto; }
+  .ex-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  .ex-table td { padding: 4px 8px; border-top: 1px solid rgba(255,255,255,.05); vertical-align: middle; }
+  .ex-vs { white-space: nowrap; }
+  .ex-score { font-variant-numeric: tabular-nums; font-weight: 700; white-space: nowrap; }
+  .ex-outcome { color: var(--muted); }
+  .ex-contrib { text-align: right; font-variant-numeric: tabular-nums; font-weight: 700; white-space: nowrap; }
+  .ex-pos { color: #46d39a; }
+  .ex-neg { color: var(--accent-2); }
+  .ex-zero { color: var(--muted); }
+  /* tint the row by outcome with a thin left accent */
+  .ex-table tr.ex-win  td:first-child { box-shadow: inset 3px 0 0 0 #46d39a; }
+  .ex-table tr.ex-loss td:first-child { box-shadow: inset 3px 0 0 0 var(--accent-2); }
+  .ex-table tr.ex-tie  td:first-child { box-shadow: inset 3px 0 0 0 var(--muted); }
+  .ex-table tr.ex-total td { border-top: 2px solid var(--border); padding-top: 7px; }
+  .ex-legend { font-size: 12px; margin-top: 14px; line-height: 1.5; }
+  @media (max-width: 600px) {
+    .ex-outcome { display: none; }   /* drop the wordy column on small screens */
+    .ex-table { font-size: 12px; }
+  }
+
   /* status readout under the bar */
   .sl-votes { color: var(--text); font-weight: 600; }
   .sl-ready { color: var(--wave-b); font-weight: 700; }
@@ -420,6 +461,10 @@
         <span><kbd>↑</kbd><kbd>↓</kbd> switch track</span>
         <span><kbd>←</kbd><kbd>→</kbd> jump 2s</span>
       </div>
+
+      <!-- Why this ranking? A transparent breakdown of every head-to-head and
+           how it built each track's score. Populated by renderExplain(). -->
+      <div id="explainWrap" class="explain-wrap"></div>
 
       <div class="toolbar" style="margin-top:18px;">
         <button class="ghost" id="shareTestFromResults">🔗 Copy test link</button>
@@ -1622,8 +1667,99 @@ function showResults(items, opts) {
 
   Engine.activeKey = items[0] ? items[0].key : null; // first track audible by default
   onTransportTick();
+
+  // "Why this ranking?" table — only on the real ranked view, and only when we
+  // can reconstruct the votes. Rebuild a core from the saved log so it works on
+  // reload (the log is the source of truth) and call explain().
+  renderExplain(isRanked, items);
+
   show("results");
   syncUrl(currentFolder, "results");
+}
+
+// Render the transparency table: for each track, the head-to-head record behind
+// its rank, and how each result fed its score — proving WHY the winner won.
+function renderExplain(isRanked, items) {
+  const wrap = document.getElementById("explainWrap");
+  if (!wrap) return;
+  wrap.innerHTML = "";
+  if (!isRanked) return;
+
+  // Reconstruct the engine from the saved vote log (works after reload).
+  const Core = window.PreferenceCore;
+  const state = currentFolder ? Store.load(currentFolder) : null;
+  const voteLog = (state && state.votes) || [];
+  if (!Core || !voteLog.length) return;
+
+  const keys = items.map(it => it.key);
+  const core = new Core(keys);
+  core.replay(voteLog);
+  const explain = core.explain();
+
+  // map a key to its display name (real filename — names are revealed here)
+  const byKey = new Map(items.map(it => [it.key, it]));
+  const nameOf = (k) => {
+    const it = byKey.get(k);
+    return it ? (it.file ? it.file.replace(/\.[^.]+$/, "") : k) : k;
+  };
+  const OUTCOME = {
+    "beat":         { label: "you preferred it",        cls: "ex-win"  },
+    "lost":         { label: "you preferred the other", cls: "ex-loss" },
+    "tied":         { label: "too close to call",       cls: "ex-tie"  },
+    "leaning-win":  { label: "leaning your way",        cls: "ex-win"  },
+    "leaning-loss": { label: "leaning the other way",   cls: "ex-loss" },
+    "even":         { label: "dead even so far",        cls: "ex-tie"  },
+  };
+
+  let html = `<details class="explain" open>
+    <summary><strong>Why this ranking?</strong> <span class="muted">— every comparison you made, and how it added up</span></summary>`;
+
+  for (const e of explain) {
+    const name = nameOf(e.key);
+    const tieTag = e.tied ? ` <span class="tie-note">≈ tied for #${e.rank}</span>` : "";
+    // a one-line plain-English summary of this track's record
+    const beat = e.matchups.filter(m => m.outcome === "beat").map(m => nameOf(m.opp));
+    const lost = e.matchups.filter(m => m.outcome === "lost").map(m => nameOf(m.opp));
+    const summaryBits = [];
+    if (beat.length) summaryBits.push(`beat ${beat.length}`);
+    if (lost.length) summaryBits.push(`lost to ${lost.length}`);
+    const recordLine = `${e.votesWon} of ${e.votesTotal} picks went its way`;
+
+    html += `<div class="ex-card">
+      <div class="ex-head">
+        <span class="ex-rank">#${e.rank}</span>
+        <span class="ex-name">${escapeHtml(name)}${tieTag}</span>
+        <span class="ex-rec muted">${recordLine}</span>
+      </div>
+      <table class="ex-table"><tbody>`;
+    // running total so the per-row contributions visibly SUM to the score that
+    // ranked this track — proving the order isn't arbitrary.
+    let _scoreTotal = 0;
+    for (const m of e.matchups) _scoreTotal += m.contribution;
+    for (const m of e.matchups) {
+      const o = OUTCOME[m.outcome] || { label: m.outcome, cls: "" };
+      const contrib = (m.contribution >= 0 ? "+" : "") + m.contribution.toFixed(2);
+      const contribCls = m.contribution > 0.01 ? "ex-pos" : m.contribution < -0.01 ? "ex-neg" : "ex-zero";
+      html += `<tr class="${o.cls}">
+        <td class="ex-vs">vs <strong>${escapeHtml(nameOf(m.opp))}</strong> <span class="muted">#${m.oppRank}</span></td>
+        <td class="ex-score">${m.wins}–${m.loss}</td>
+        <td class="ex-outcome">${o.label}</td>
+        <td class="ex-contrib ${contribCls}">${contrib}</td>
+      </tr>`;
+    }
+    const totalStr = (_scoreTotal >= 0 ? "+" : "") + _scoreTotal.toFixed(2);
+    html += `<tr class="ex-total">
+        <td colspan="3"><strong>Total score</strong> <span class="muted">— sum of the column → sets the rank</span></td>
+        <td class="ex-contrib"><strong>${totalStr}</strong></td>
+      </tr>`;
+    html += `</tbody></table></div>`;
+  }
+
+  html += `<p class="ex-legend muted">The last column is how much each matchup added to (or subtracted from) this track's score.
+    A win counts for more when it's over a <em>higher-ranked</em> track and you picked it <em>consistently</em> —
+    a single lucky pick barely moves it. That's how a track can finish on top even without beating everyone head-to-head.</p>
+  </details>`;
+  wrap.innerHTML = html;
 }
 
 function escapeHtml(s) {

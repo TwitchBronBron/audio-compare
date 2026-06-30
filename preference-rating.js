@@ -331,6 +331,66 @@
       return rows;
     }
 
+    /* ---- explain ------------------------------------------------------- *
+     * A full, human-readable breakdown of HOW each item got its rank — the
+     * transparency table behind the results. For every item, in ranked order:
+     *   {
+     *     key, rank, tied,
+     *     score,        // Copeland (matchups won − lost)
+     *     oppScore,     // opponent-weighted score (the tiebreak that ranks cycles)
+     *     votesWon, votesTotal,
+     *     matchups: [   // one row per opponent actually played, best-beaten first
+     *       { opp, oppRank, wins, loss, games, state, outcome, contribution }
+     *     ]
+     *   }
+     * `outcome` ∈ "beat" | "lost" | "tied" | "leaning" (provisional). `contribution`
+     * is this matchup's signed term in the opponent-weighted score, so the table
+     * can literally show "beating <stronger opp> added +X" — proving the ranking.
+     * -------------------------------------------------------------------- */
+    explain() {
+      const n = this.n, FLOOR = PreferenceCore.MEET_FLOOR;
+      const rk = this.ranking();
+      const rankOf = new Map(rk.map(r => [r.key, r.rank]));
+
+      // opponent quality (same bounded squash _opponentWeighted uses), from Copeland
+      const maxAbs = Math.max(1, ...rk.map(r => Math.abs(r.score)));
+      const qualByKey = {};
+      for (const r of rk) qualByKey[r.key] = 1 + 0.5 * (r.score / maxAbs);
+
+      return rk.map(row => {
+        const i = this.idx.get(row.key);
+        const matchups = [];
+        for (let j = 0; j < n; j++) {
+          if (j === i) continue;
+          const oppKey = this.keys[j];
+          const g = this.games[i][j];
+          if (!g) continue;                       // never compared → nothing to show
+          const w = this.wins[i][j], l = this.wins[j][i];
+          const ps = this.pairState(Math.min(i, j), Math.max(i, j));
+          let outcome;
+          if (ps.state === "decided") outcome = ps.leader === i ? "beat" : "lost";
+          else if (ps.state === "tied") outcome = "tied";
+          else outcome = w > l ? "leaning-win" : w < l ? "leaning-loss" : "even";
+          const net = (w - l) / g;
+          const reliability = Math.min(1, g / FLOOR) * Math.abs(net);
+          const contribution = net * (1 + (qualByKey[oppKey] - 1) * reliability);
+          matchups.push({
+            opp: oppKey, oppRank: rankOf.get(oppKey),
+            wins: w, loss: l, games: g, state: ps.state, outcome,
+            net, contribution,
+          });
+        }
+        // order: biggest positive contribution first (your most valuable wins on top)
+        matchups.sort((a, b) => b.contribution - a.contribution);
+        return {
+          key: row.key, rank: row.rank, tied: row.tied,
+          score: row.score, oppScore: row.oppScore,
+          votesWon: row.votesWon, votesTotal: row.votesTotal,
+          matchups,
+        };
+      });
+    }
+
     /* ---- cluster detection (Tarjan SCC on the "tie/cycle" graph) -------- *
      * Build a directed graph where i → j means "i is at-least-as-good as j with
      * no clear loss to j": specifically we add BOTH directions i↔j when the pair
