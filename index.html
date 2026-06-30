@@ -565,6 +565,12 @@
  * ------------------------------------------------------------------ */
 const AUDIO_ROOT = "audio/";
 
+// Bump this whenever you replace any MP3 file on disk. It appends ?v=N to every
+// audio URL, so the browser fetches the new file instead of serving a cached
+// copy of the old one. (A plain Ctrl+F5 reloads the HTML but NOT the MP3s, which
+// JS fetches separately — that's why swapped files keep playing stale.)
+const AUDIO_VERSION = 2;
+
 // Debug mode reveals the real track names + the live rating-engine internals
 // during comparisons (to verify the blind test is hiding the "answer"). Off by
 // default. Persisted in localStorage and toggled from the header button — the
@@ -1335,7 +1341,7 @@ function makeItem(folder, filename) {
     file: filename,
     name: displayName(filename),
     key: folder + "::" + filename,
-    url: AUDIO_ROOT + encodeURIComponent(folder) + "/" + encodeURIComponent(filename),
+    url: AUDIO_ROOT + encodeURIComponent(folder) + "/" + encodeURIComponent(filename) + "?v=" + AUDIO_VERSION,
   };
 }
 
