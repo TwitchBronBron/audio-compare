@@ -146,6 +146,45 @@
       return edge;
     }
 
+    /* ---- opponent-weighted score --------------------------------------- *
+     * A win over a STRONG guitar is worth more than a win over a weak one — but
+     * only if that win is RELIABLE (repeated/decisive), not a fluke. This is the
+     * refinement that breaks genuine cycles: in a rock-paper-scissors loop the
+     * members aren't really equal — one beat the *stronger* opponents on balance,
+     * and this surfaces that.
+     *
+     * For each item i, sum over opponents j it has played:
+     *     net(i,j) · weight(j)
+     *   net(i,j)  = (wins_ij − wins_ji) / games_ij        // −1..+1, your lean
+     *   weight(j) = 1 + (qual(j) − 1) · reliability(i,j)   // 0.5..1.5, faded in
+     *   qual(j)   = opponent j's strength, squashed to [0.5, 1.5] (BOUNDED so no
+     *               single result can run away — keeps the top catchable)
+     *   reliability(i,j) = min(1, games/MEET_FLOOR) · |net|  // a fluke 1–0 ≈ 0,
+     *               a solid 5–1 ≈ 1. Quality credit only counts once the result
+     *               is proven, so an upset must be REPEATED to move the ranking.
+     *
+     * `base` is a per-item strength estimate used as the opponent-quality source
+     * (we pass in the plain Copeland scores). Computed in ONE pass — no iteration —
+     * so the "beat-the-strong" credit can't compound into a blow-up.
+     * -------------------------------------------------------------------- */
+    _opponentWeighted(base) {
+      const n = this.n, FLOOR = PreferenceCore.MEET_FLOOR;
+      const maxAbs = Math.max(1, ...base.map(v => Math.abs(v)));
+      const qual = base.map(v => 1 + 0.5 * (v / maxAbs));   // bounded 0.5..1.5
+      const out = new Array(n).fill(0);
+      for (let i = 0; i < n; i++) {
+        for (let j = 0; j < n; j++) {
+          if (i === j) continue;
+          const g = this.games[i][j];
+          if (!g) continue;
+          const net = (this.wins[i][j] - this.wins[j][i]) / g;
+          const reliability = Math.min(1, g / FLOOR) * Math.abs(net);
+          out[i] += net * (1 + (qual[j] - 1) * reliability);
+        }
+      }
+      return out;
+    }
+
     // P(i is preferred over j) as a simple smoothed win rate — handy for the UI
     // and tests. Laplace-smoothed so an unseen pair reads 0.5.
     winProb(aKey, bKey) {
@@ -250,14 +289,40 @@
       // these as strongly-connected components of the "decided beats" graph,
       // augmented so confirmed-tied / unresolved-even pairs also link.
       const clusterId = this._clusters(rows);
-      // assign Olympic ranks per cluster in sorted order
-      let rank = 1;
+
+      // ---- opponent-weighted score BREAKS clusters into real ranks --------
+      // Plain Copeland can leave a cycle / dead-even group clustered. But those
+      // members aren't truly equal: one beat the STRONGER opponents (reliably).
+      // The opponent-weighted score surfaces that and gives them distinct, REAL
+      // scores — so we use it to separate cluster members into their own ranks.
+      // They only STAY tied if even the weighted score is an exact dead heat
+      // (genuinely no signal to separate them).
+      const oppScore = this._opponentWeighted(copeland);
+      for (const row of rows) row.oppScore = oppScore[row._i];
+      // re-sort: clusters stay contiguous and in Copeland order (so the weighting
+      // never moves an item ACROSS cluster lines — it can't override clean direct
+      // results elsewhere), but WITHIN a cluster, order by opponent-weighted score.
+      const clusterRank = new Map();   // clusterId -> first index in Copeland order
+      rows.forEach((row, p) => {
+        const cid = clusterId[row._i];
+        if (!clusterRank.has(cid)) clusterRank.set(cid, p);
+      });
+      rows.sort((a, b) => {
+        const ca = clusterRank.get(clusterId[a._i]), cb = clusterRank.get(clusterId[b._i]);
+        if (ca !== cb) return ca - cb;                       // keep cluster grouping
+        return (b.oppScore - a.oppScore) || (b.net - a.net) || (b.winRate - a.winRate);
+      });
+
+      // assign ranks. Within a cluster, the opponent-weighted score SEPARATES
+      // members into distinct ranks; two only share a rank if their weighted
+      // scores are an exact dead heat (truly nothing to tell them apart).
+      const OPP_EPS = 1e-9;
       for (let p = 0; p < rows.length; p++) {
-        if (p > 0 && clusterId[rows[p]._i] === clusterId[rows[p - 1]._i]) {
-          rows[p].rank = rows[p - 1].rank;     // same cluster → shared rank
-        } else {
-          rows[p].rank = p + 1;                // new cluster (Olympic gap)
-        }
+        if (p === 0) { rows[p].rank = 1; continue; }
+        const prev = rows[p - 1], cur = rows[p];
+        const sameCluster = clusterId[cur._i] === clusterId[prev._i];
+        const deadHeat = sameCluster && Math.abs(cur.oppScore - prev.oppScore) < OPP_EPS;
+        rows[p].rank = deadHeat ? prev.rank : p + 1;
       }
       const countByRank = {};
       for (const row of rows) countByRank[row.rank] = (countByRank[row.rank] || 0) + 1;
@@ -871,15 +936,40 @@
         c.vote(x, y, rng() < 0.5 + 0.2 * gap ? better : worse);
       }
       const rk = c.ranking();
-      const posOf = {}; rk.forEach((r, i) => posOf[r.key] = i);
+      const posOf = {}, rankOf = {};
+      rk.forEach((r, i) => { posOf[r.key] = i; rankOf[r.key] = r.rank; });
       let inversions = 0;
       for (let i = 0; i < c.n; i++) for (let j = i + 1; j < c.n; j++) {
         const ps = c.pairState(i, j);
         if (ps.state !== "decided") continue;
         const hi = ps.leader, lo = hi === i ? j : i;
-        if (posOf[keys[hi]] > posOf[keys[lo]]) inversions++;
+        // A cross-CLUSTER inversion is the real bug. Within a tie cluster a decided
+        // pair can be "inverted" — that's exactly what a cycle is (resolved by the
+        // opponent-weighted score), so it's expected, not a violation.
+        if (rankOf[keys[hi]] !== rankOf[keys[lo]] && posOf[keys[hi]] > posOf[keys[lo]]) inversions++;
       }
-      ok(inversions === 0, "ranking never contradicts a decided head-to-head");
+      ok(inversions === 0, "ranking never contradicts a decided H2H across clusters");
+    })();
+
+    // ---- 21. Asymmetric cycle is broken by opponent quality --------------
+    // A 3-cycle A>B>C>A (all decided) has no Copeland order. But it's ASYMMETRIC
+    // here: A also beats two strong outsiders (X, Y) reliably, while B and C only
+    // beat the weak one. The member with the stronger reliable wins (A) should
+    // separate to the top of the cluster rather than staying in a blob.
+    (function () {
+      const c = new PreferenceCore(["A", "B", "C", "X", "Y"]);
+      // 3-cycle among A,B,C
+      voteN(c, "A", "B", 3); voteN(c, "B", "C", 3); voteN(c, "C", "A", 3);
+      // X and Y are strong (each beats B and C), but A beats X and Y → A's wins
+      // are over stronger opponents, so A should rise within the cycle cluster.
+      voteN(c, "A", "X", 3); voteN(c, "A", "Y", 3);
+      voteN(c, "X", "B", 3); voteN(c, "X", "C", 3);
+      voteN(c, "Y", "B", 3); voteN(c, "Y", "C", 3);
+      const rk = c.ranking();
+      const rankOf = {}; rk.forEach(r => rankOf[r.key] = r.rank);
+      // A beat strong X,Y; B and C lost to them → A should outrank B and C.
+      ok(rankOf["A"] < rankOf["B"] && rankOf["A"] < rankOf["C"],
+        "asymmetric cycle: the member with stronger reliable wins (A) rises to the top");
     })();
 
     // ---- summary ---------------------------------------------------------

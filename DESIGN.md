@@ -101,28 +101,51 @@ subjective preferences often do — see below).
 2. **Order** by Copeland, breaking ties by the direct decided head-to-head
    (direct preference is king), then net win-fraction, then overall win rate.
 3. **Cluster** via strongly-connected components of the "decided beats" graph
-   (Tarjan SCC). Items you have no consistent preference among end up in the same
-   cluster and share an Olympic rank (two "1st", then "3rd"). A cluster forms
-   from EITHER:
-     - a **cycle** of decided results (A>B, B>C, C>A — rock-paper-scissors), or
-     - a **confirmed tie** between items at equal Copeland standing.
+   (Tarjan SCC). A cluster forms from a **cycle** of decided results (A>B, B>C,
+   C>A — rock-paper-scissors) or a **confirmed tie** at equal Copeland standing.
    Decided results that don't form a cycle never merge; an unsettled
    (provisional) pair is a *tentative order*, not a tie, so it does not merge.
+4. **Break clusters by opponent-weighted score.** Members of a cycle aren't
+   really equal — one usually beat the *stronger* opponents on balance. Within a
+   cluster we order members by the opponent-weighted score (below), giving them
+   distinct, real ranks. They only stay tied (shared rank) if even that score is
+   a dead heat — a genuinely symmetric cycle with no signal to separate.
+
+### Opponent-weighted score — "a win over a strong guitar is worth more"
+
+A win over a strong opponent should count more than a win over a weak one — but
+only if it's a RELIABLE result, not a fluke. For each item, summed over the
+opponents it has played:
+
+    net(i,j)  = (wins_ij − wins_ji) / games_ij            // −1..+1, your lean
+    qual(j)   = opponent j's Copeland strength, squashed to [0.5, 1.5]  (BOUNDED)
+    reliability(i,j) = min(1, games/MEET_FLOOR) · |net|   // fluke 1–0 ≈ 0, 5–1 ≈ 1
+    contribution = net(i,j) · (1 + (qual(j) − 1) · reliability(i,j))
+
+Three deliberate stabilizers (so this can't become the runaway Bradley–Terry was):
+- **Bounded** weight (0.5×–1.5×): no single result can dominate; the top stays
+  catchable.
+- **One pass, no iteration**: the "beat-the-strong" credit can't compound into a
+  blow-up.
+- **Reliability-gated**: a lucky 1–0 upset over the champ contributes ~nothing;
+  the credit fades in only as the result is repeated/confirmed. So early rounds
+  behave like plain round-robin counting (you're still figuring out your answer),
+  and quality-weighting only matters once records are solid — which is also when
+  it's stable.
+
+It is used ONLY to order WITHIN a cluster (it never moves an item across cluster
+lines, so it can't override clean direct results elsewhere).
 
 ### Cycles are a real outcome, not a bug
 
 With enough votes on close items, preferences often form a loop: you pick A over
 B, B over C, C over A depending on what you're A/B-ing in the moment. **No
-ranking — not this one, not Bradley–Terry, not a bracket — can order a cycle
-without violating one of your direct picks.** So instead of inventing a false
-#1, the tool reports the cycle members as a **tied cluster** ("you preferred
-these in a loop — no consistent favorite"). This is the same principle as a
-confirmed tie, applied to cycles: when the data says "these are equivalent to
-you," we say so rather than faking a winner.
-
-This applies at **every position, including #1**: a cycle (or confirmed tie) at
-the top is a **winner's circle** of co-winners, shown together. "No clear #1" is
-not a stuck state — it *is* the answer.
+*pairwise* rule can order a cycle without violating one of your direct picks.**
+The opponent-weighted score resolves it the fair way — by *who* each member beat
+— so an asymmetric cycle yields a real winner. A perfectly symmetric cycle (every
+member equivalent) honestly stays a tie: when the data says "these are equal,"
+we say so. A cycle/tie at #1 is a **winner's circle**, shown together; "no clear
+#1" is not a stuck state — it *is* the answer.
 
 ## The progress bar — three phases, one bar
 
