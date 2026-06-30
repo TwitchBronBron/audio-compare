@@ -1036,70 +1036,113 @@ function refreshFolderList() {
   }
 }
 
+/* ------------------------------------------------------------------ *
+ * Client-side router — hashbang routes are the single source of truth.
+ *   #!/                      → home (set list)
+ *   #!/<set>                 → take / resume the test (compare)
+ *   #!/<set>/ranking         → your ranked results (rebuilt from your votes)
+ *   #!/<set>/listen          → neutral listen-only view (shareable with anyone)
+ * Navigation = set the hash; the hashchange handler renders. Reload, back/
+ * forward, and sharing all "just work" because the hash fully describes the view.
+ * ------------------------------------------------------------------ */
+const Router = {
+  _suppress: false,   // guard so programmatic hash writes don't double-handle
+
+  // Parse the current hash into { folder, view }. folder=null ⇒ home.
+  parse() {
+    let h = location.hash || "";
+    if (h.startsWith("#!")) h = h.slice(2);
+    else if (h.startsWith("#")) h = h.slice(1);
+    const segs = h.split("/").filter(Boolean).map(decodeURIComponent);
+    if (!segs.length) return { folder: null, view: "home" };
+    const folder = segs[0];
+    const v = segs[1];
+    const view = (v === "ranking" || v === "listen") ? v : "compare";
+    return { folder, view };
+  },
+
+  // Build the hash string for a target.
+  hashFor(folder, view) {
+    if (!folder) return "#!/";
+    const seg = encodeURIComponent(folder);
+    if (view === "ranking" || view === "listen") return "#!/" + seg + "/" + view;
+    return "#!/" + seg;
+  },
+
+  // Absolute shareable link.
+  link(folder, view) {
+    return location.origin + location.pathname + location.search + this.hashFor(folder, view);
+  },
+
+  // Navigate. `replace` updates the current history entry instead of pushing.
+  go(folder, view, opts) {
+    const target = this.hashFor(folder, view);
+    if (location.hash === target) { this.handle(); return; }   // same hash → render anyway
+    if (opts && opts.replace) {
+      history.replaceState(null, "", location.pathname + location.search + target);
+      this.handle();
+    } else {
+      location.hash = target;   // triggers hashchange → handle()
+    }
+  },
+
+  // Quietly rewrite the hash to mirror the current view WITHOUT re-routing.
+  // replaceState does NOT fire hashchange, so no suppression needed.
+  sync(folder, view) {
+    const target = this.hashFor(folder, view);
+    if (location.hash === target) return;
+    history.replaceState(null, "", location.pathname + location.search + target);
+  },
+
+  // The one entry point that renders the app to match the hash.
+  handle() {
+    if (this._suppress) { this._suppress = false; return; }
+    const { folder, view } = this.parse();
+    if (!folder || !folderNames.includes(folder)) { goToSelect(); return; }
+    startSet(folder, { view });
+  },
+};
+
+// Back-compat shim: existing render code calls syncUrl(folder, view) to mirror
+// the current view into the address bar. Delegate to the router's quiet sync
+// (null folder ⇒ home). Keeps the app functional without rewriting every call.
+function syncUrl(folder, view) {
+  if (!folder) { Router.sync(null, "home"); return; }
+  Router.sync(folder, view);
+}
+
 async function init() {
   try {
     const entries = await listDir(AUDIO_ROOT);
     folderNames = entries.filter(e => e.type === "directory").map(e => e.name);
     refreshFolderList();
 
-    // Shareable links — the URL is the SOURCE OF TRUTH for routing, so reload
-    // always lands on the view the address bar names:
-    //   ?set=Foo                 → take / resume the test (compare screen)
-    //   ?set=Foo&view=ranking    → YOUR ranked results (rebuilt from your votes)
-    //   ?set=Foo&view=listen     → neutral listen-only view (shared "skip ahead")
-    // Legacy: ?view=results maps to the listen view (what old shared links meant).
+    // One-time migration: turn old ?set=Foo&view=… links into the hash route.
     const params = new URLSearchParams(location.search);
-    const set = params.get("set");
-    if (set && folderNames.includes(set)) {
+    const legacySet = params.get("set");
+    if (legacySet && !location.hash) {
       const v = params.get("view");
-      let view;
+      let view = "compare";
       if (v === "ranking") view = "ranking";
       else if (v === "listen") view = "listen";
       else if (v === "results") {
-        // legacy param: if this browser finished a ranking for the set, it meant
-        // "my results"; otherwise it's a shared "listen" link.
-        const st = Store.load(set);
+        const st = Store.load(legacySet);
         view = (st && st.done && st.ranking) ? "ranking" : "listen";
-      } else view = "compare";
-      startSet(set, { view });
+      }
+      // drop the querystring, move into the hash
+      history.replaceState(null, "", location.pathname + Router.hashFor(legacySet, view));
     }
-    // Otherwise land on the set list — per-folder progress is still saved, so
-    // picking a set resumes it.
+
+    window.addEventListener("hashchange", () => Router.handle());
+    Router.handle();   // route the initial URL
   } catch (e) {
     els.selectErr.textContent = "Couldn't load /audio listing: " + e.message;
   }
 }
 
-// Update the address bar so the current view is itself a shareable link
-// (without adding a history entry on every navigation).
-// view ∈ "compare" | "ranking" | "listen". The address bar mirrors the current
-// view so reload (and sharing) lands exactly where you are.
-function syncUrl(folder, view) {
-  const params = new URLSearchParams(location.search);
-  if (folder) {
-    params.set("set", folder);
-    if (view === "ranking" || view === "listen") params.set("view", view);
-    else params.delete("view");
-  } else {
-    params.delete("set");
-    params.delete("view");
-  }
-  const qs = params.toString();
-  history.replaceState(null, "", location.pathname + (qs ? "?" + qs : ""));
-}
-
-// Build an absolute share link. "ranking" links are personal (only resolve for a
-// browser that has the votes); "listen" links are the neutral share-with-anyone.
-function shareLink(folder, view) {
-  const params = new URLSearchParams();
-  params.set("set", folder);
-  if (view === "ranking" || view === "listen") params.set("view", view);
-  return location.origin + location.pathname + "?" + params.toString();
-}
-
 // Copy a share link to the clipboard and flash feedback on the button.
 async function copyShareLink(btn, folder, view) {
-  const ok = await copyText(shareLink(folder, view));
+  const ok = await copyText(Router.link(folder, view));
   const old = btn.textContent;
   btn.textContent = ok ? "✓ Copied!" : "copy failed";
   setTimeout(() => { btn.textContent = old; }, 1400);
