@@ -619,8 +619,11 @@
       else phase = 3;
 
       // ---- tier ----------------------------------------------------------
+      // "building" only applies BEFORE the first round-robin is complete. Once a
+      // full ranking exists, the floor is "pretty-sure" — a late vote that briefly
+      // un-locks the winner must not drop the label back to "building".
       let tier;
-      if (!winnerLocked) tier = "building";
+      if (!complete) tier = "building";
       else if (competence >= 0.85) tier = "rock-solid";
       else if (competence >= 0.5) tier = "confident";
       else tier = "pretty-sure";

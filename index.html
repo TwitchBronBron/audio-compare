@@ -285,8 +285,8 @@
 
   /* results lanes reuse the A/B lane layout; rank pill on top, name below */
   .lane .rank-pill {
-    flex: 0 0 auto; width: 26px; height: 26px; border-radius: 50%;
-    display: grid; place-items: center; font-weight: 800; font-size: 13px;
+    flex: 0 0 auto; width: 34px; height: 34px; border-radius: 50%;
+    display: grid; place-items: center; font-weight: 800; font-size: 16px;
     background: var(--panel); border: 1px solid var(--border);
   }
   .lane.top1 .rank-pill { background: gold; color: #222; border-color: gold; }
@@ -296,6 +296,14 @@
   .center { text-align: center; }
   .muted { color: var(--muted); }
   .err { color: #ff6b6b; }
+
+  /* breadcrumb trail at the top of a card */
+  .crumbs { margin: -4px 0 12px; }
+  .crumb-link {
+    background: none; border: none; padding: 2px 0; margin: 0;
+    color: var(--muted); font: inherit; font-size: 13px; cursor: pointer;
+  }
+  .crumb-link:hover { color: var(--text); background: none; }
 
   /* "Why this ranking?" transparency table */
   .explain-wrap { margin-top: 22px; }
@@ -343,8 +351,9 @@
   /* status readout under the bar */
   .sl-votes { color: var(--text); font-weight: 600; }
   .sl-ready { color: var(--wave-b); font-weight: 700; }
-  .sl-round { color: var(--accent); font-weight: 600; }
-  .sl-tier  { color: var(--accent); font-weight: 600; }
+  .sl-round  { color: var(--accent); font-weight: 600; }
+  .sl-tier   { color: var(--accent); font-weight: 600; }
+  .sl-invite { color: var(--muted); }
   .sl-dot   { opacity: .5; }
   .sl-rem   { white-space: nowrap; }
   .sl-num   { position: relative; font-weight: 700; color: var(--text); }
@@ -399,6 +408,7 @@
   <!-- STEP 2: compare -->
   <section id="step-compare" class="hidden">
     <div class="card">
+      <nav class="crumbs"><button class="crumb-link" id="compareCrumbHome">← All sets</button></nav>
       <div style="display:flex;justify-content:space-between;align-items:baseline;gap:8px;flex-wrap:wrap;">
         <strong id="compareTitle"></strong>
         <span class="muted compare-count" id="compareCount"></span>
@@ -408,7 +418,7 @@
       <div class="progress-bar precision" id="precisionBar">
         <div class="progress-fill" id="progressFill"></div>
       </div>
-      <p class="muted compare-help" style="margin-top:0">Play, then tap between A and B to compare. Pick the one you prefer. Each dot is one full round (every pair compared once) — do as many as you like.</p>
+      <p class="muted compare-help" style="margin-top:0">Tap A/B to compare, then pick your favorite. Each dot = one full round.</p>
 
       <div class="vs-wrap" id="vsWrap"></div>
 
@@ -430,8 +440,6 @@
       </div>
 
       <div class="toolbar center" style="justify-content:center;margin-top:18px;">
-        <button class="ghost" id="shareTest">🔗 Copy test link</button>
-        <button class="ghost" id="compareBack">← Back to all sets</button>
         <button class="ghost" id="restartAll">↺ Start over</button>
       </div>
 
@@ -450,8 +458,16 @@
   <!-- STEP 3: results -->
   <section id="step-results" class="hidden">
     <div class="card">
+      <nav class="crumbs"><button class="crumb-link" id="resultsCrumbHome">← All sets</button></nav>
       <h2 style="margin-top:0;" id="resultsHeading">Final ranking</h2>
-      <p class="muted" id="resultsBlurb">Your ranking, best at the top. Click any track to hear it, or click a waveform to jump to a spot.</p>
+
+      <!-- Primary actions up top: keep refining is the main next step. -->
+      <div class="toolbar" style="margin:4px 0 14px;">
+        <button class="primary" id="resultsStartOver">➕ Keep refining</button>
+        <button class="ghost" id="resultsRestartScratch">↺ Rank again from scratch</button>
+      </div>
+
+      <p class="muted" id="resultsBlurb">Best at the top. “≈ tied” = preferred about equally.</p>
 
       <div class="vs-wrap" id="resultsLanes"></div>
 
@@ -466,16 +482,8 @@
         <span><kbd>←</kbd><kbd>→</kbd> jump 2s</span>
       </div>
 
-      <div class="toolbar" style="margin-top:18px;">
-        <button class="ghost" id="shareTestFromResults">🔗 Copy test link</button>
-        <button class="ghost" id="shareResults">🔗 Copy results link</button>
-        <button class="ghost" id="resultsStartOver">↺ Rank this set again</button>
-        <button class="ghost" id="resultsRestart">← Back to all sets</button>
-      </div>
-
       <!-- Why this ranking? A transparent breakdown of every head-to-head and
-           how it built each track's score. Populated by renderExplain().
-           Kept LAST on the page — it's the deep-dive, below the action buttons. -->
+           how it built each track's score. Populated by renderExplain(). -->
       <div id="explainWrap" class="explain-wrap"></div>
     </div>
   </section>
@@ -1332,16 +1340,28 @@ const TIER_LABEL = {
 // finish the current round. Vote count is always shown.
 //   "12 votes · Round 2 · +5 to finish this round"
 //   once a round completes & a ranking exists: "· Ranking ready ✓"
+// The readout has three honest states (vote count is ALWAYS shown):
+//   1) before round 1 finishes  → "+N to your first ranking" (must keep going)
+//   2) a round JUST finished, nothing new started → "Ranking ready ✓ · <tier> ·
+//      vote more to refine" (NO countdown — a new round isn't forced)
+//   3) mid-round (already started the next) → "Ranking ready ✓ · <tier> ·
+//      +N to finish round X" (a round is genuinely in progress)
 function statusParts(s, voteCount) {
   const lead = voteCount + (voteCount === 1 ? " vote" : " votes");
-  const round = `Round ${s.currentRound}`;
-  return {
-    lead,
-    round,
-    remaining: s.votesToRound,           // votes to finish the current round
-    tail: "to finish this round",
-    ready: s.complete,                   // at least one full round-robin done
-  };
+  const tier = TIER_LABEL[s.tier] || s.tier;
+  // state 1: first round-robin not done yet
+  if (!s.complete) {
+    return { lead, remaining: s.votesToRound, tail: "to your first ranking" };
+  }
+  // a round is "in progress" only once at least one pair is into the next round
+  const midRound = s.roundProgress > 0;
+  if (midRound) {
+    // state 3
+    return { lead, ready: true, tier, remaining: s.votesToRound,
+             tail: `to finish round ${s.currentRound}` };
+  }
+  // state 2: a round just completed — invite, don't demand
+  return { lead, ready: true, tier, invite: "vote more to refine" };
 }
 
 // remember the last remaining-count so we can flash the delta (−1 / +2) on change
@@ -1376,17 +1396,18 @@ function renderStatusLine(p) {
   const parts = [];
   parts.push(`<span class="sl-votes">${p.lead}</span>`);
   if (p.ready) parts.push(`<span class="sl-ready">Ranking ready ✓</span>`);
-  parts.push(`<span class="sl-round">${p.round}</span>`);
+  if (p.tier) parts.push(`<span class="sl-tier">${p.tier}</span>`);
   if (p.remaining > 0) {
     parts.push(`<span class="sl-rem">+<span class="sl-num">${p.remaining}</span> ${p.tail}</span>`);
+  } else if (p.invite) {
+    parts.push(`<span class="sl-invite">${p.invite}</span>`);
   }
   el.innerHTML = parts.join(' <span class="sl-dot">·</span> ');
 
-  // flash the delta if the remaining number changed
-  const cur = p.remaining;
-  if (_lastRemaining != null && cur !== _lastRemaining) {
-    const delta = cur - _lastRemaining;
-    flashDelta(el.querySelector(".sl-num"), delta);
+  // flash the delta if the remaining number changed (only when a count is shown)
+  const cur = p.remaining > 0 ? p.remaining : null;
+  if (_lastRemaining != null && cur != null && cur !== _lastRemaining) {
+    flashDelta(el.querySelector(".sl-num"), cur - _lastRemaining);
   }
   _lastRemaining = cur;
 }
@@ -1726,8 +1747,8 @@ function showResults(items, opts) {
   }
   document.getElementById("resultsHeading").textContent = heading;
   document.getElementById("resultsBlurb").textContent = isRanked
-    ? "Your ranking, best at the top. Tracks marked “≈ tied” you preferred about equally. Click any track to hear it, or a waveform to jump."
-    : "All tracks in this set. Click any track to hear it, or click a waveform to jump to a spot.";
+    ? "Best at the top. “≈ tied” = preferred about equally."
+    : "All tracks in this set — click to listen.";
   // From a ranked view this re-enters the vote loop WITHOUT wiping — so you can
   // keep voting to tighten confidence. From a no-ranking listening view it just
   // starts the test fresh.
@@ -1910,30 +1931,21 @@ document.getElementById("finishRanking").addEventListener("click", () => {
   if (rater) rater.finish();
 });
 document.getElementById("restartAll").addEventListener("click", startOverCurrent);
-document.getElementById("compareBack").addEventListener("click", goToSelect);
-// "Keep refining" / "Take the test": re-enter the vote loop, preserving the
-// saved vote log so more votes build on existing confidence (no wipe).
+document.getElementById("compareCrumbHome").addEventListener("click", goToSelect);
+// "Keep refining": re-enter the vote loop, preserving the saved vote log so more
+// votes build on existing confidence (no wipe).
 document.getElementById("resultsStartOver").addEventListener("click", () => {
   if (!currentFolder) return goToSelect();
   Engine.reset();
   startSet(currentFolder, { refine: true });
 });
-document.getElementById("resultsRestart").addEventListener("click", goToSelect);
+// "Rank again from scratch": wipe this set's saved progress and start fresh.
+document.getElementById("resultsRestartScratch").addEventListener("click", startOverCurrent);
+// breadcrumb back to the set list
+document.getElementById("resultsCrumbHome").addEventListener("click", goToSelect);
 
-// share-link buttons — grab the right link for the current set
-document.getElementById("shareTest").addEventListener("click", (e) => {
-  if (currentFolder) copyShareLink(e.currentTarget, currentFolder, "compare");
-});
 // debug-only: copy a full engine diagnostic to the clipboard
 document.getElementById("debugCopy").addEventListener("click", copyDebugDiagnostic);
-document.getElementById("shareTestFromResults").addEventListener("click", (e) => {
-  if (currentFolder) copyShareLink(e.currentTarget, currentFolder, "compare");
-});
-document.getElementById("shareResults").addEventListener("click", (e) => {
-  // a shareable listen link — resolves for anyone (a "ranking" link only works
-  // in a browser that has the votes).
-  if (currentFolder) copyShareLink(e.currentTarget, currentFolder, "listen");
-});
 
 // the header title bar also returns to the set list (when not already there)
 document.querySelector("header").addEventListener("click", () => {
