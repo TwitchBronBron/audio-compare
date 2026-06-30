@@ -371,6 +371,10 @@
   }
   #finishRanking.ready:hover { background: #34c07a; }
   #finishRanking:not(.ready) { opacity: .9; }
+  #finishRanking:disabled {
+    opacity: .45; cursor: not-allowed; background: var(--panel-2); color: var(--muted);
+  }
+  #finishRanking:disabled:hover { background: var(--panel-2); transform: none; }
 
   .toolbar { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 8px; }
 </style>
@@ -1330,15 +1334,23 @@ function flashDelta(numEl, delta) {
 function updateResultsButton(s) {
   const btn = document.getElementById("finishRanking");
   if (!btn) return;
-  if (s.preliminary) {
+  if (!s.complete) {
+    // Hard-disabled until a full round-robin sweep is done (every pair compared
+    // at least once). Before that there's no real ranking to show.
+    const n = s.counts ? s.counts.unseen : s.votesToNext;
+    btn.disabled = true;
+    btn.classList.remove("ready");
+    btn.textContent = `Show results (${n} more to finish the first round)`;
+  } else if (s.preliminary) {
     btn.disabled = false;
     btn.classList.add("ready");
     btn.textContent = "✓ Show results";
   } else {
-    btn.disabled = false;   // never hard-block — user can always peek
+    // sweep done but the winner isn't locked yet — allow viewing, just signal it.
+    btn.disabled = false;
     btn.classList.remove("ready");
     const n = s.votesToNext;
-    btn.textContent = n > 0 ? `Show results (${n} more for a full ranking)` : "Show results";
+    btn.textContent = n > 0 ? `Show results (${n} more to firm it up)` : "Show results";
   }
 }
 
