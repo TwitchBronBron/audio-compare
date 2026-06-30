@@ -476,7 +476,7 @@
         <button class="ghost" id="resultsRestartScratch">↺ Rank again from scratch</button>
       </div>
 
-      <p class="muted" id="resultsBlurb">Best at the top. “≈ tied” = preferred about equally.</p>
+      <p class="muted" id="resultsBlurb">Ranked highest to lowest. “≈” indicates a tie.</p>
 
       <div class="vs-wrap" id="resultsLanes"></div>
 
@@ -1758,7 +1758,7 @@ function showResults(items, opts) {
   }
   document.getElementById("resultsHeading").textContent = heading;
   document.getElementById("resultsBlurb").textContent = isRanked
-    ? "Best at the top. “≈ tied” = preferred about equally."
+    ? "Ranked highest to lowest. “≈” indicates a tie."
     : "All tracks in this set — click to listen.";
   // From a ranked view this re-enters the vote loop WITHOUT wiping — so you can
   // keep voting to tighten confidence. From a no-ranking listening view it just
