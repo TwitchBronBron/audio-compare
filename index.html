@@ -223,14 +223,13 @@
   .debug-panel tr.low-gate td { opacity: .5; }
   .debug-panel .dbg-warn { color: #ff8080; font-weight: 700; }
 
-  /* header debug toggle — small, unobtrusive, pushed to the right */
-  .debug-toggle {
-    margin-left: auto; font-size: 12px; padding: 4px 10px;
-    background: transparent; border: 1px solid var(--border); color: var(--muted);
-    border-radius: 6px; cursor: pointer; align-self: center;
+  /* the 🎧 logo doubles as a hidden debug toggle (triple-click). No visible
+     affordance — that's the point — but glow faintly when debug is ON so the
+     tester can see the blind test is currently defeated. */
+  .logo-mark { -webkit-user-select: none; user-select: none; }
+  .logo-mark.debug-on {
+    filter: drop-shadow(0 0 6px var(--accent-2));
   }
-  .debug-toggle:hover { border-color: var(--accent-2); color: var(--text); }
-  .debug-toggle.on { border-color: var(--accent-2); color: var(--accent-2); font-weight: 700; }
 
   /* shared modal: dimmed overlay + centered card. Used by the debug-mode
      confirmation and the per-track "how it ranked" breakdown. */
@@ -442,9 +441,8 @@
 </head>
 <body>
 <header>
-  <h1>🎧 Audio Comparison</h1>
+  <h1><span id="logoMark" class="logo-mark">🎧</span> Audio Comparison</h1>
   <span class="sub" id="headerSub">Pick a set to start ranking</span>
-  <button class="debug-toggle" id="debugToggle" type="button" title="Reveal answers while voting (for testing)">Debug</button>
 </header>
 
 <main>
@@ -663,10 +661,8 @@ function onRoundComplete(s, onContinue) {
  * is immediate. Either way we re-render so the current screen reflects it.
  * ------------------------------------------------------------------ */
 function syncDebugToggle() {
-  const btn = document.getElementById("debugToggle");
-  if (!btn) return;
-  btn.classList.toggle("on", DEBUG);
-  btn.textContent = DEBUG ? "Debug: ON" : "Debug";
+  const mark = document.getElementById("logoMark");
+  if (mark) mark.classList.toggle("debug-on", DEBUG);
 }
 function setDebug(on) {
   DEBUG = on;
@@ -2181,10 +2177,22 @@ document.getElementById("resultsCrumbHome").addEventListener("click", goToSelect
 // debug-only: copy a full engine diagnostic to the clipboard
 document.getElementById("debugCopy").addEventListener("click", copyDebugDiagnostic);
 
-// header debug toggle. stopPropagation so it doesn't trigger the header's
-// "go home" click below. Reflect the persisted state on load.
-const _debugToggleBtn = document.getElementById("debugToggle");
-_debugToggleBtn.addEventListener("click", (e) => { e.stopPropagation(); onDebugToggleClick(); });
+// Hidden debug toggle: TRIPLE-CLICK the 🎧 logo. No visible button, so testers
+// can reveal answers but ordinary users won't stumble onto it (and can't cheat).
+// stopPropagation so the clicks don't also trigger the header's "go home" handler.
+// Reflect the persisted state on load (glow when on).
+(function () {
+  const mark = document.getElementById("logoMark");
+  if (!mark) return;
+  let clicks = 0, timer = null;
+  mark.addEventListener("click", (e) => {
+    e.stopPropagation();
+    clicks++;
+    clearTimeout(timer);
+    if (clicks >= 3) { clicks = 0; onDebugToggleClick(); return; }
+    timer = setTimeout(() => { clicks = 0; }, 600);   // reset if clicks slow down
+  });
+})();
 syncDebugToggle();
 
 // the header title bar also returns to the set list (when not already there)
