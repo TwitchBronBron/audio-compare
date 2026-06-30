@@ -1184,6 +1184,9 @@ async function startSet(folder, opts) {
     _lastDotCount = -1;                  // force the round dots to rebuild for this set
     rater.replay(state.votes || []);     // rebuild ratings from the saved log
     state.done = false;                  // re-entering the loop reopens the set
+    Store.save(folder, state);           // PERSIST it, so a refresh resumes the
+                                         // test (not the results) — the URL has no
+                                         // view param now, and saved state agrees.
     // record each new vote into the log and persist immediately
     rater.record = (kA, kB, winner) => {
       state.votes.push({ a: kA, b: kB, winner });
