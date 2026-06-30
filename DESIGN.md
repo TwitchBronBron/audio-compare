@@ -181,29 +181,25 @@ about *confidence milestones*, while the "you're done, here's your ranking" stat
 is governed by completion. A user can be "done" (has a full ranking) while the
 bar still invites more votes to firm it up.
 
-## The competence score (NOT statistical confidence)
+## The confidence tier — driven by ROUNDS COMPLETED
 
-A felt "I'm pretty sure → more sure → really sure," not a p-value (the user
-explicitly did not want it to feel statistical). Shown as a **tier label**
-(headline) with the **bar fill** providing motion so the needle visibly moves
-on each vote.
+Shown as a tier label. The principle the user settled on: **the more full
+round-robins you've done, the more confident — full stop.** It's simple,
+monotonic (rounds only increase, so it never bounces), and a tie still earns
+high confidence (you've done the work; the answer just happens to be "equal").
 
-    Pretty sure  →  Confident  →  Rock solid
+    0 rounds → "building"       (before the first round-robin completes)
+    1 round  → "Pretty sure"
+    2 rounds → "Confident"
+    3 rounds → "Very confident"
+    4+ rounds→ "Rock solid"
 
-Computed as the **weakest link**: a ranking is only as trustworthy as its
-shakiest adjacent pair. For each adjacent pair in the standings, its "sureness"
-is how lopsided and how repeated its head-to-head is:
-
-    margin   = |wins_ij - wins_ji| / games_ij      // 0..1, how one-sided
-    backing  = min(1, games_ij / MEET_FLOOR)        // how many meetings back it
-    sureness = margin * backing                     // decided-far + well-met = high
-                                                    // a confirmed TIE counts as
-                                                    // sure too (we KNOW it's even)
-
-The competence score is the minimum sureness across adjacent boundaries
-(treating a confirmed tie boundary as fully sure — we are confident they're
-equal). One pass → mostly low backing → "Pretty sure." Grinding raises every
-boundary → "Rock solid."
+History worth keeping: earlier versions tied this to a *statistical* measure
+(separation of adjacent items, weakest-link). That wiggled — a genuine near-tie
+stays close no matter how much you vote, so it read as low/volatile confidence,
+which confused users sitting next to a steadily-climbing round bar. Rounds-based
+confidence removed the wiggle and matches intuition. (`competence`, the old
+evidence-average, is still computed in status() but no longer drives the tier.)
 
 ## "Votes remaining" — the retention number
 

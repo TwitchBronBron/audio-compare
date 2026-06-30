@@ -585,23 +585,33 @@
       const winners = rows.filter(r => r.rank === topRank).map(r => r.key);
 
       // ---- competence: weakest adjacent boundary -------------------------
-      // Each adjacent boundary's "sureness": a decided gap = margin·backing; a
-      // confirmed tie boundary counts as fully sure (we KNOW it's even).
-      let competence = 1;
-      for (let p = 0; p < rows.length - 1; p++) {
-        if (rows[p].rank === rows[p + 1].rank) continue;   // inside a tie cluster
-        const i = this.idx.get(rows[p].key), j = this.idx.get(rows[p + 1].key);
-        const ps = this.pairState(i, j);
-        let sure;
-        if (ps.state === "tied") sure = 1;                  // confirmed equal
-        else if (ps.games === 0) sure = 0;
-        else {
-          const margin = Math.abs(ps.wins - ps.loss) / ps.games;
-          const backing = Math.min(1, ps.games / PreferenceCore.MEET_FLOOR);
-          sure = margin * backing;
+      // Confidence = HOW MUCH EVIDENCE backs the ranking — it only grows with
+      // votes and NEVER punishes a tie. The old metric measured "how separated"
+      // adjacent items are, so a genuine near-tie read as low confidence and
+      // wiggled with every vote. Wrong: a 3–3 tie after enough votes is a
+      // CONFIDENT result ("these are equal"), and more voting should only ever
+      // raise confidence.
+      //
+      // Each pair contributes its "evidence" in [0,1]:
+      //   decided  → 1   (you clearly prefer one — a settled answer)
+      //   tied     → 1   (confirmed equal — also a settled answer)
+      //   provisional → games / MEET_FLOOR   (partial: building toward settled)
+      //   unseen   → 0
+      // Confidence is the average across all pairs. Because casting a vote can
+      // only move a pair toward settled (never back to unseen), this rises
+      // monotonically as you keep going — a tie included.
+      let evid = 0, pairs = 0;
+      for (let i = 0; i < n; i++) {
+        for (let j = i + 1; j < n; j++) {
+          const ps = this.pairState(i, j);
+          let e;
+          if (ps.state === "decided" || ps.state === "tied") e = 1;
+          else if (ps.state === "provisional") e = Math.min(1, ps.games / PreferenceCore.MEET_FLOOR);
+          else e = 0;
+          evid += e; pairs++;
         }
-        competence = Math.min(competence, sure);
       }
+      const competence = pairs ? evid / pairs : 1;
 
       // ---- the bar: simple round-robin progress --------------------------
       // No phase magic. The bar IS how far through the round-robins you are:
@@ -619,13 +629,16 @@
       else phase = 3;
 
       // ---- tier ----------------------------------------------------------
-      // "building" only applies BEFORE the first round-robin is complete. Once a
-      // full ranking exists, the floor is "pretty-sure" — a late vote that briefly
-      // un-locks the winner must not drop the label back to "building".
+      // Confidence follows ROUNDS COMPLETED — the more full round-robins you've
+      // done, the more confident, monotonically (a tie included). It never bounces
+      // because rounds only ever increase. "building" only before round 1 is done.
+      //   0 rounds → building · 1 → pretty-sure · 2 → confident · 3 → very-confident
+      //   4+ → rock-solid
       let tier;
       if (!complete) tier = "building";
-      else if (competence >= 0.85) tier = "rock-solid";
-      else if (competence >= 0.5) tier = "confident";
+      else if (roundsComplete >= 4) tier = "rock-solid";
+      else if (roundsComplete >= 3) tier = "very-confident";
+      else if (roundsComplete >= 2) tier = "confident";
       else tier = "pretty-sure";
 
       // ---- next milestone + votes remaining ------------------------------
