@@ -209,9 +209,14 @@
   .debug-panel .dbg-warn { color: #ff8080; font-weight: 700; }
 
   /* shared transport bar under the lanes */
+  /* transport + keyboard hints: side by side on desktop, stacked on mobile */
+  .transport-row {
+    display: flex; align-items: center; gap: 24px; flex-wrap: wrap;
+    margin-top: 14px;
+  }
   .transport {
     display: flex; align-items: center; gap: 16px;
-    margin-top: 14px; padding: 6px 2px;
+    padding: 6px 2px;
   }
   .transport-play {
     width: 52px; height: 52px; border-radius: 50%; padding: 0;
@@ -240,7 +245,7 @@
   .transport-mute.is-muted { color: var(--accent-2); border-color: var(--accent-2); }
   .t-time { font-variant-numeric: tabular-nums; color: var(--muted); font-size: 14px; }
   .t-hint {
-    color: var(--muted); font-size: 13px; margin-top: 8px;
+    color: var(--muted); font-size: 13px;
     display: flex; flex-wrap: wrap; gap: 4px 14px;
   }
   .t-hint kbd {
@@ -270,6 +275,8 @@
     .wave-label .nm { font-size: 13px; }
     canvas.waveform { height: 72px; }
 
+    /* stack transport above hints again on small screens */
+    .transport-row { flex-direction: column; align-items: flex-start; gap: 8px; }
     .transport { gap: 12px; flex-wrap: wrap; }
     .transport-play { width: 48px; height: 48px; }
 
@@ -422,15 +429,17 @@
 
       <div class="vs-wrap" id="vsWrap"></div>
 
-      <div class="transport">
-        <button class="transport-play" id="transportPlay" title="Play / pause both"></button>
-        <button class="transport-mute" id="transportMute" title="Mute / unmute"></button>
-        <span class="t-time"><span id="tCur">0:00</span> / <span id="tDur">0:00</span></span>
-      </div>
-      <div class="t-hint">
-        <span><kbd>space</kbd> play / pause</span>
-        <span><kbd>↑</kbd><kbd>↓</kbd> switch A / B</span>
-        <span><kbd>←</kbd><kbd>→</kbd> jump 2s</span>
+      <div class="transport-row">
+        <div class="transport">
+          <button class="transport-play" id="transportPlay" title="Play / pause both"></button>
+          <button class="transport-mute" id="transportMute" title="Mute / unmute"></button>
+          <span class="t-time"><span id="tCur">0:00</span> / <span id="tDur">0:00</span></span>
+        </div>
+        <div class="t-hint">
+          <span><kbd>space</kbd> play / pause</span>
+          <span><kbd>↑</kbd><kbd>↓</kbd> switch A / B</span>
+          <span><kbd>←</kbd><kbd>→</kbd> jump 2s</span>
+        </div>
       </div>
 
       <div class="pick-row" id="pickRow"></div>
@@ -471,15 +480,17 @@
 
       <div class="vs-wrap" id="resultsLanes"></div>
 
-      <div class="transport">
-        <button class="transport-play" id="resultsPlay" title="Play / pause all"></button>
-        <button class="transport-mute" id="resultsMute" title="Mute / unmute"></button>
-        <span class="t-time"><span id="rCur">0:00</span> / <span id="rDur">0:00</span></span>
-      </div>
-      <div class="t-hint">
-        <span><kbd>space</kbd> play / pause</span>
-        <span><kbd>↑</kbd><kbd>↓</kbd> switch track</span>
-        <span><kbd>←</kbd><kbd>→</kbd> jump 2s</span>
+      <div class="transport-row">
+        <div class="transport">
+          <button class="transport-play" id="resultsPlay" title="Play / pause all"></button>
+          <button class="transport-mute" id="resultsMute" title="Mute / unmute"></button>
+          <span class="t-time"><span id="rCur">0:00</span> / <span id="rDur">0:00</span></span>
+        </div>
+        <div class="t-hint">
+          <span><kbd>space</kbd> play / pause</span>
+          <span><kbd>↑</kbd><kbd>↓</kbd> switch track</span>
+          <span><kbd>←</kbd><kbd>→</kbd> jump 2s</span>
+        </div>
       </div>
 
       <!-- Why this ranking? A transparent breakdown of every head-to-head and
