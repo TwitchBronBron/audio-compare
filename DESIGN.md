@@ -133,6 +133,22 @@ clickable, opening a per-track step-by-step modal (your record vs each rival →
 total wins → rank). Shown only on the ranked results view, never mid-vote (blind
 test).
 
+### Per-matchup outcome wording (`gradeOutcome`, LOCKED)
+
+Each head-to-head gets a plain-English outcome from its raw W–L, graded by how
+lopsided the pick was. This wording was deliberated and settled — do not "improve"
+it without asking:
+
+    even split        → "too close to call"
+    win, share ≥ 80%  → "strongly preferred"
+    win, share ≥ 62%  → "moderately preferred"
+    win, otherwise    → "slightly preferred"
+    (losing side mirrors: "strongly / moderately / slightly disfavored")
+
+Rejected alternatives: "clearly" (reads the same as "strongly"), "narrowly", and
+"slight edge to it / the other way" (clunky; "the other way" makes the reader work
+out which way). The loss side is "disfavored", NOT "the other way".
+
 ## Blind test
 
 The voting screen NEVER reveals track names (no winner name in the status line,

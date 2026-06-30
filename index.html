@@ -1982,10 +1982,10 @@ function gradeOutcome(wins, loss) {
   if (wins === loss) return { label: "too close to call", cls: "ex-tie" };
   const total = wins + loss;
   const share = Math.max(wins, loss) / total;          // 0.5..1
-  const strength = share >= 0.80 ? "strongly" : share >= 0.62 ? "clearly" : "narrowly";
+  const strength = share >= 0.80 ? "strongly" : share >= 0.62 ? "moderately" : "slightly";
   return wins > loss
     ? { label: `${strength} preferred`,  cls: "ex-win"  }
-    : { label: `${strength} the other way`, cls: "ex-loss" };
+    : { label: `${strength} disfavored`, cls: "ex-loss" };
 }
 
 // Reconstruct the rating engine from the saved vote log (works after reload —
