@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Edit",
+      "Write"
+    ],
+    "allowedPaths": [
+      "\\\\TRUENAS\\share\\**",
+      "Z:\\**"
+    ]
+  }
+}
